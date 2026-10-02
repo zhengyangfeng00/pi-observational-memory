@@ -1,6 +1,6 @@
 import { agentLoop, type AgentContext, type AgentLoopConfig, type AgentTool } from "@earendil-works/pi-agent-core";
 import type { Message, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { Type } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, Type } from "@earendil-works/pi-ai";
 import type { Static } from "typebox";
 import { hashId } from "../../ids.js";
 import { logAgentStreamError } from "../stream-errors.js";
@@ -70,9 +70,9 @@ type RecordObservationsArgs = Static<typeof RecordObservationsSchema>;
 
 /**
  * Thrown when the agent loop ends with an API/stream failure (`stopReason`
- * `"error"`/`"aborted"`) without recording anything. agent-core returns such
- * runs normally, so without this the caller cannot tell a hard failure from a
- * deliberate empty result (#32).
+ * `"error"`/`"aborted"`) without recording anything, or on any failed multimodal
+ * run (partial records cannot grant coverage). agent-core returns such runs
+ * normally, so the caller needs an explicit failure rather than an empty result.
  */
 export class ObserverStreamError extends Error {
 	readonly stopReason: string;
@@ -222,7 +222,26 @@ NEW CONVERSATION CHUNK:
 	validateObserverRequest(model, llmContext, config.maxTokens!);
 	const providerStream = resolveWorkerStreamSimple(model, args.modelRegistry, args.streamSimple);
 	const guardedStream: WorkerStreamSimple = (nextModel, nextContext, options) => {
-		validateObserverRequest(nextModel, nextContext, options?.maxTokens ?? config.maxTokens!);
+		try {
+			validateObserverRequest(nextModel, nextContext, options?.maxTokens ?? config.maxTokens!);
+		} catch (error) {
+			// Public agentLoop detaches runAgentLoop without rejection handling.
+			// A guard failure must therefore terminate via its stream protocol,
+			// allowing the worker to discard partial records and retry fallback.
+			const failed = createAssistantMessageEventStream();
+			failed.push({
+				type: "error", reason: "error",
+				error: {
+					role: "assistant", api: nextModel.api, provider: nextModel.provider, model: nextModel.id,
+					content: [], timestamp: Date.now(), stopReason: "error",
+					errorMessage: error instanceof Error ? error.message : String(error),
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				},
+			});
+			failed.end();
+			return failed;
+		}
 		return providerStream(nextModel, nextContext, options);
 	};
 	const loop = args.agentLoop ?? agentLoop;

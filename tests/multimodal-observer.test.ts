@@ -108,8 +108,13 @@ describe("multimodal observer", () => {
 		await expect(runObserver({ ...args, priorObservations: ["漢".repeat(40_000)], chunk: source, agentLoop: loop })).rejects.toThrow("image_budget");
 		expect(loop).not.toHaveBeenCalled();
 		const provider = vi.fn();
-		await runObserver({ ...args, chunk: source, streamSimple: provider, agentLoop: loopWith((_prompts, _context, _config, stream) => {
-			expect(() => stream(model, { systemPrompt: "s".repeat(50_000), messages: [{ role: "user", content: source, timestamp: 0 }], tools: [{ name: "huge", parameters: { payload: "t".repeat(40_000) } }] }, { maxTokens: 8_192 })).toThrow("image_budget");
+		await runObserver({ ...args, chunk: source, streamSimple: provider, agentLoop: loopWith(async (_prompts, _context, _config, stream) => {
+			const failed = stream(model, { systemPrompt: "s".repeat(50_000), messages: [{ role: "user", content: source, timestamp: 0 }], tools: [{ name: "huge", parameters: { payload: "t".repeat(40_000) } }] }, { maxTokens: 8_192 });
+			expect(await failed.result()).toMatchObject({ stopReason: "error", errorMessage: expect.stringContaining("image_budget"), content: [], usage: { totalTokens: 0 } });
+			const events = [];
+			for await (const event of failed) events.push(event);
+			expect(events).toHaveLength(1);
+			expect(events[0].type).toBe("error");
 			expect(provider).not.toHaveBeenCalled();
 		}) });
 	});
