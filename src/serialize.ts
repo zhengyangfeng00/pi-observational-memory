@@ -1,4 +1,5 @@
-import type { Message, TextContent, ToolResultMessage } from "@earendil-works/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import { estimateStringTokens } from "./tokens.js";
 
 function pad(n: number): string {
@@ -51,7 +52,8 @@ function textAndPlaceholders(
 			continue;
 		}
 		if (block.type === "toolCall" && typeof block.name === "string") {
-			parts.push(`[${block.name}(${JSON.stringify(block.arguments ?? {})})]`);
+			const name = typeof block.namespace === "string" ? `${block.namespace}.${block.name}` : block.name;
+			parts.push(`[${name}(${JSON.stringify(block.arguments ?? {})})${typeof block.id === "string" ? ` id=${block.id}` : ""}]`);
 			continue;
 		}
 		parts.push("[non-text content omitted]");
@@ -59,40 +61,31 @@ function textAndPlaceholders(
 	return parts.join("\n");
 }
 
-function textOnly(content: unknown): string {
-	if (content == null) return "";
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.filter((b): b is TextContent => b?.type === "text" && typeof b.text === "string")
-		.map((b) => b.text)
-		.join("\n");
+function serializeMessage(msg: AgentMessage, time: string, recall = false): string {
+	switch (msg.role) {
+		case "user": return `[User @ ${time}]: ${textAndPlaceholders(msg.content)}`;
+		case "assistant": return `[Assistant @ ${time}]: ${textAndPlaceholders(msg.content, { includeThinking: true, omitRedactedThinking: true })}`;
+		case "toolResult": return `[Tool result${recall ? ":" : " for"} ${msg.toolName} @ ${time}]: ${textAndPlaceholders(msg.content)}\n[Tool call id: ${msg.toolCallId}; error: ${msg.isError}]`;
+		case "system": {
+			// Structured prompt/loadout changes are payload too, not just content.
+			const { role: _role, timestamp: _timestamp, content, ...checkpoint } = msg;
+			return `[System @ ${time}]: ${textAndPlaceholders(content)}\n${JSON.stringify(checkpoint)}`;
+		}
+		case "bashExecution": {
+			// Use Pi's own converter so command, output, exit/cancellation and
+			// truncation/path annotations exactly match the host's model context.
+			const projected = convertToLlm([msg])[0];
+			return `[Bash execution @ ${time}]: ${projected ? textAndPlaceholders(projected.content) : "[Excluded from model context]"}`;
+		}
+		case "custom": return `[Custom (${msg.customType}) @ ${time}]: ${textAndPlaceholders(msg.content)}`;
+		case "branchSummary": return `[Branch summary @ ${time}]: ${msg.summary}`;
+		case "compactionSummary": return `[Compaction summary @ ${time}]: ${msg.summary}`;
+		default: return `[Unsupported source message @ ${time}]: ${JSON.stringify(msg)}`;
+	}
 }
 
-export function serializeConversation(messages: Message[]): string {
-	return messages
-		.map((msg): string | null => {
-			const time = formatTimestamp(msg.timestamp);
-			if (msg.role === "user") {
-				const text = textOnly(msg.content);
-				return `[User @ ${time}]: ${text}`;
-			}
-			if (msg.role === "assistant") {
-				const body = textAndPlaceholders(msg.content, {
-					includeThinking: true,
-					omitRedactedThinking: true,
-				})
-					.split("\n")
-					.filter(Boolean)
-					.join("\n");
-				if (!body) return null;
-				return `[Assistant @ ${time}]: ${body}`;
-			}
-			const text = textOnly(msg.content);
-			return `[Tool result for ${(msg as ToolResultMessage).toolName} @ ${time}]: ${text}`;
-		})
-		.filter((line): line is string => line !== null)
-		.join("\n\n");
+export function serializeConversation(messages: AgentMessage[]): string {
+	return messages.map((msg) => serializeMessage(msg, formatTimestamp(msg.timestamp))).join("\n\n");
 }
 
 export function nowTimestamp(): string {
@@ -120,16 +113,7 @@ export type RenderableEntry = {
 
 function renderCustomMessage(entry: RenderableEntry, options: { recallFormat: boolean }): string {
 	const time = options.recallFormat ? formatRecallTimestamp(entry.timestamp) : formatTimestamp(entry.timestamp);
-	const text = options.recallFormat
-		? textAndPlaceholders(entry.content)
-		: typeof entry.content === "string"
-			? entry.content
-			: Array.isArray(entry.content)
-				? (entry.content as Array<{ type?: string; text?: string }>)
-						.filter((b) => b?.type === "text" && typeof b.text === "string")
-						.map((b) => b.text as string)
-						.join("\n")
-				: "";
+	const text = textAndPlaceholders(entry.content);
 	if (options.recallFormat) {
 		const origin = entry.customType ? `Custom message (${entry.customType})` : "Custom message";
 		return `[${origin} @ ${time}]: ${text}`;
@@ -142,7 +126,7 @@ export function serializeBranchEntries(entries: RenderableEntry[]): string {
 	const blocks: string[] = [];
 	for (const entry of entries) {
 		if (entry.type === "message" && entry.message) {
-			const part = serializeConversation([entry.message as Message]);
+			const part = serializeConversation([entry.message as AgentMessage]);
 			if (part) blocks.push(part);
 			continue;
 		}
@@ -163,6 +147,7 @@ export type SourceAddressedSerialization = {
 	sourceEntryIds: string[];
 	estimatedTokens: number;
 	truncatedSourceEntryIds: string[];
+	incompleteSourceEntryIds: string[];
 };
 
 export type SourceAddressedSerializationOptions = {
@@ -190,6 +175,32 @@ function isSourceRenderableEntry(entry: RenderableEntry): boolean {
 	return entry.type === "message" || entry.type === "custom_message" || entry.type === "branch_summary";
 }
 
+function isCompleteContent(content: unknown): boolean {
+	if (typeof content === "string") return true;
+	return Array.isArray(content) && content.every((block) => {
+		if (!block || typeof block !== "object") return false;
+		if (block.type === "text") return typeof block.text === "string";
+		if (block.type === "thinking") return block.redacted === true || typeof block.thinking === "string";
+		if (block.type === "toolCall") return typeof block.name === "string" && block.arguments !== undefined;
+		// A text-only observer cannot prove coverage of images/unknown blocks.
+		return false;
+	});
+}
+
+function isCompleteSource(entry: RenderableEntry): boolean {
+	if (entry.type === "custom_message") return isCompleteContent(entry.content);
+	if (entry.type === "branch_summary") return typeof entry.summary === "string";
+	if (!entry.message || typeof entry.message !== "object") return false;
+	const msg = entry.message as Record<string, unknown>;
+	switch (msg.role) {
+		case "user": case "assistant": case "toolResult": case "system": case "custom":
+			return isCompleteContent(msg.content);
+		case "bashExecution": return typeof msg.command === "string" && typeof msg.output === "string";
+		case "branchSummary": case "compactionSummary": return typeof msg.summary === "string";
+		default: return false;
+	}
+}
+
 /**
  * Serialize complete source entries up to the token budget. If the first entry
  * alone exceeds the budget, report a clearly marked head/tail excerpt. Callers
@@ -203,10 +214,15 @@ export function serializeSourceAddressedBranchEntries(
 	const blocks: string[] = [];
 	const sourceEntryIds: string[] = [];
 	const truncatedSourceEntryIds: string[] = [];
+	const incompleteSourceEntryIds: string[] = [];
 	let estimatedTokens = 0;
 
 	for (const entry of entries) {
 		if (!entry.id || !isSourceRenderableEntry(entry)) continue;
+		if (!isCompleteSource(entry)) {
+			if (blocks.length === 0) incompleteSourceEntryIds.push(entry.id);
+			break; // Observe a complete prefix first; never jump past this payload.
+		}
 		const rawRendered = serializeBranchEntries([entry]);
 		const rendered = rawRendered.trim() ? rawRendered : "[Source entry has no serializable text]";
 		const label = `[Source entry id: ${entry.id}]`;
@@ -232,28 +248,13 @@ export function serializeSourceAddressedBranchEntries(
 	}
 
 	const text = blocks.join("\n\n");
-	return { text, sourceEntryIds, estimatedTokens: estimateStringTokens(text), truncatedSourceEntryIds };
+	return { text, sourceEntryIds, estimatedTokens: estimateStringTokens(text), truncatedSourceEntryIds, incompleteSourceEntryIds };
 }
 
 function renderRecallMessage(entry: RenderableEntry): string | null {
 	if (!entry.message || typeof entry.message !== "object") return null;
-	const msg = entry.message as Message;
-	const time = formatRecallTimestamp(msg.timestamp, entry.timestamp);
-	if (msg.role === "user") {
-		return `[User @ ${time}]: ${textAndPlaceholders(msg.content)}`;
-	}
-	if (msg.role === "assistant") {
-		const body = textAndPlaceholders(msg.content, {
-			includeThinking: true,
-			omitRedactedThinking: true,
-		})
-			.split("\n")
-			.filter(Boolean)
-			.join("\n");
-		if (!body) return null;
-		return `[Assistant @ ${time}]: ${body}`;
-	}
-	return `[Tool result: ${(msg as ToolResultMessage).toolName} @ ${time}]: ${textAndPlaceholders(msg.content)}`;
+	const msg = entry.message as AgentMessage;
+	return serializeMessage(msg, formatRecallTimestamp(msg.timestamp, entry.timestamp), true);
 }
 
 export function renderRecallSourceEntry(entry: RenderableEntry): string | null {

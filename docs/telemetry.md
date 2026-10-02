@@ -69,15 +69,32 @@ and captured branch prefix to still match. Appended turns are allowed; session
 replacement or navigation invalidates outstanding work. A new identity has shape
 `{ version: 1, fromExclusiveId: string|null, sourceEntryIds: string[], truncatedSourceEntryIds: string[] }`.
 The ordered IDs must exactly cover the source range after the previous committed
-frontier. Legacy V3 records without this field retain their historical contiguous
-`coversUpToId` meaning only when the record and every cited source validate on
-this branch; future/dangling/foreign markers never grant coverage.
+frontier. Legacy V3 records without complete-input coverage identity **never**
+grant a safe frontier: historical workers could mark head/tail excerpts covered.
+Their memory remains queryable, but original source must be re-observed in full.
+Consolidation prioritizes that recovery backlog even below ordinary thresholds
+or when a post-compaction provider-growth delta is zero. Recovery drains complete
+oldest-first chunks until new committed evidence reaches the old watermark;
+normal scheduling then resumes. Passive mode still suppresses background work.
+Future/dangling/foreign markers never grant coverage.
 
 Excerpt-only observer input does not grant coverage. An oversized source that
 cannot fit the configured observer budget fails with `incomplete_source` and
 requires raising the budget or using a larger-context memory model. Empty output
 also does not grant coverage; this milestone does not introduce coverage-only
 empty ledger records.
+
+The source serializer handles Pi's user, assistant, tool-result, system, custom,
+branch-summary, compaction-summary and bash-execution message roles explicitly.
+Bash command/output and exit, cancellation and truncation/path annotations use
+Pi's own `convertToLlm` conversion. Excluded bash executions remain excluded from
+worker input. System prompt/loadout checkpoint fields are included alongside
+content. Images, unknown content blocks, unknown message roles and malformed
+payloads do not grant coverage: the serializer reports `incompleteSourceEntryIds`
+and the observer emits an explicit `unsupported_source` failure. A supported
+prefix can be processed first; the unsupported entry is never skipped. Recall
+may still show non-text placeholders, but those placeholders are not observation
+evidence. Telemetry entry types and envelope/snapshot versions remain unchanged.
 
 The hook clamps Pi's desired `firstKeptEntryId` backwards to a valid Pi cut point
 at or before the first uncovered source. It never cuts at a tool result. A

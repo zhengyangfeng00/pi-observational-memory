@@ -639,7 +639,7 @@ describe("V3 consolidation trigger", () => {
 			textCustomMessage("raw-1", "aaaaaaaa"),
 			observationsRecordedEntry("om-obs-a", { observations: [obsA], coversUpToId: "raw-1" }),
 			textCustomMessage("raw-2", "bbbbbbbb"),
-			observationsRecordedEntry("om-obs-b", { observations: [obsB], coversUpToId: "raw-2" }),
+			observationsRecordedEntry("om-obs-b", { observations: [obsB], coversUpToId: "raw-2", coverage: { version: 1, fromExclusiveId: "raw-1", sourceEntryIds: ["raw-2"], truncatedSourceEntryIds: [] } }),
 		];
 		const { fire, runLaunchedWork, pi } = setup({ entries, observeAfterTokens: 999, observationsPoolMaxTokens: 10 });
 
@@ -689,7 +689,7 @@ describe("V3 consolidation trigger", () => {
 			textCustomMessage("raw-1", "aaaaaaaa"),
 			observationsRecordedEntry("om-obs-a", { observations: [obsA], coversUpToId: "raw-1" }),
 			textCustomMessage("raw-2", "bbbbbbbb"),
-			observationsRecordedEntry("om-obs-b", { observations: [obsB], coversUpToId: "raw-2" }),
+			observationsRecordedEntry("om-obs-b", { observations: [obsB], coversUpToId: "raw-2", coverage: { version: 1, fromExclusiveId: "raw-1", sourceEntryIds: ["raw-2"], truncatedSourceEntryIds: [] } }),
 		];
 		const { fire, runLaunchedWork, pi } = setup({ entries, observeAfterTokens: 999, observationsPoolMaxTokens: 10 });
 
@@ -709,7 +709,7 @@ describe("V3 consolidation trigger", () => {
 			textCustomMessage("raw-1", "aaaaaaaa"),
 			observationsRecordedEntry("om-obs-a", { observations: [obsA], coversUpToId: "raw-1" }),
 			textCustomMessage("raw-2", "bbbbbbbb"),
-			observationsRecordedEntry("om-obs-b", { observations: [obsB], coversUpToId: "raw-2" }),
+			observationsRecordedEntry("om-obs-b", { observations: [obsB], coversUpToId: "raw-2", coverage: { version: 1, fromExclusiveId: "raw-1", sourceEntryIds: ["raw-2"], truncatedSourceEntryIds: [] } }),
 		];
 		const { fire, runLaunchedWork, pi } = setup({ entries, observeAfterTokens: 999, appendEntryReturnsId: false, observationsPoolMaxTokens: 10 });
 

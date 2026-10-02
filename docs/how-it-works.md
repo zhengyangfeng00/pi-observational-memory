@@ -89,6 +89,12 @@ customType: "om.observations.recorded"
 data: {
   observations: Observation[];
   coversUpToId: string;
+  coverage: {
+    version: 1;
+    fromExclusiveId: string | null;
+    sourceEntryIds: string[];
+    truncatedSourceEntryIds: string[]; // empty for a complete-input commit
+  };
 }
 ```
 
@@ -172,7 +178,13 @@ The observer trigger runs on `turn_end`.
 10. Run `runObserver()` in a background task.
 11. Validate source ids returned by the model.
 12. Compute deterministic 12-character ids and per-observation token counts in code.
-13. Append `om.observations.recorded` only if at least one observation was accepted.
+13. Append `om.observations.recorded` only if at least one observation was accepted and the complete ordered input range validates.
+
+Legacy observation records lacking complete-input evidence do not grant coverage.
+Their original source is re-observed oldest-first, even below normal scheduling
+thresholds or with zero post-compaction provider growth. Existing memory remains
+queryable while that recovery completes. Unsupported source payloads (including
+images and unknown roles/blocks) fail explicitly rather than being silently omitted.
 
 If no observations are generated, the worker writes no entry and does not advance coverage. A later eligible observer run will see a larger range. Deliberate empty runs back off until another `observeAfterTokens` worth of new source tokens arrives, so they do not re-fire every turn. Observer chunks use the configured/model-derived token budget, oldest-first, so a large backlog drains in complete-entry slices. An individual source that only fits as an excerpt fails with `incomplete_source` and retains coverage; raise the budget to observe it in full. API/stream failures surface as `observer failed` / `observer.stream_error` rather than as an empty run.
 

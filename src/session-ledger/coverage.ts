@@ -27,19 +27,29 @@ export function committedObserverFrontier(entries: Entry[]): { id: string | null
 			return position !== undefined && position <= end && source(entries[position]);
 		}))) continue;
 		const coverage = (entry.data as typeof entry.data & { coverage?: ObserverCoverage }).coverage;
-		if (coverage !== undefined) {
-			if (coverage === null || typeof coverage !== "object") continue;
-			const expected = entries.slice(index + 1, end + 1).filter(source).map((item) => item.id);
-			if (coverage.version !== 1 || coverage.fromExclusiveId !== (entries[index]?.id ?? null)
-				|| !Array.isArray(coverage.sourceEntryIds)
-				|| JSON.stringify(coverage.sourceEntryIds) !== JSON.stringify(expected)
-				|| !Array.isArray(coverage.truncatedSourceEntryIds)
-				|| coverage.truncatedSourceEntryIds.length > 0) continue;
-		}
-		// Legacy V3 records carry the historical contiguous coversUpToId contract.
+		// Historical coversUpToId alone cannot prove full input: legacy workers
+		// were allowed to cover head/tail excerpts. Re-observe before trusting it.
+		if (coverage === undefined || coverage === null || typeof coverage !== "object") continue;
+		const expected = entries.slice(index + 1, end + 1).filter(source).map((item) => item.id);
+		if (coverage.version !== 1 || coverage.fromExclusiveId !== (entries[index]?.id ?? null)
+			|| !Array.isArray(coverage.sourceEntryIds)
+			|| JSON.stringify(coverage.sourceEntryIds) !== JSON.stringify(expected)
+			|| !Array.isArray(coverage.truncatedSourceEntryIds)
+			|| coverage.truncatedSourceEntryIds.length > 0) continue;
 		index = end;
 	}
 	return { id: entries[index]?.id ?? null, index };
+}
+
+/** Upgrade recovery must not be suppressed by a small post-compaction provider delta. */
+export function hasLegacyObservationBacklog(entries: Entry[]): boolean {
+	const frontier = committedObserverFrontier(entries);
+	const indexes = new Map(entries.map((entry, index) => [entry.id, index]));
+	return entries.some((entry, recordIndex) => {
+		if (!isObservationsRecordedEntry(entry) || (entry.data as typeof entry.data & { coverage?: unknown }).coverage !== undefined) return false;
+		const end = indexes.get(entry.data.coversUpToId) ?? -1;
+		return end > frontier.index && end < recordIndex && end >= 0 && source(entries[end]);
+	});
 }
 
 export function committedReflectionFrontier(entries: Entry[]): string | null {

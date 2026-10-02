@@ -69,8 +69,10 @@ describe("standalone Pi session persistence and projection", () => {
 		const s = harness();
 		const root = user(s.manager, "root");
 		const left = user(s.manager, "left branch");
-		// Valid legacy coverage illustrates historical branch-local records.
-		s.manager.appendCustomEntry("om.observations.recorded", { observations: [observation("aaaaaaaaaaaa", { sourceEntryIds: [root, left] })], coversUpToId: left });
+		s.manager.appendCustomEntry("om.observations.recorded", {
+			observations: [observation("aaaaaaaaaaaa", { sourceEntryIds: [root, left] })], coversUpToId: left,
+			coverage: { version: 1, fromExclusiveId: null, sourceEntryIds: [root, left], truncatedSourceEntryIds: [] },
+		});
 		persistMemoryState(s.pi as any, s.ctx);
 		expect(buildMemorySnapshot(s.ctx).observedThrough).toBe(left);
 		s.manager.branch(root);

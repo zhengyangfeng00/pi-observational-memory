@@ -31,7 +31,7 @@ import {
 	type V3MemoryCustomType,
 } from "../session-ledger/index.js";
 
-import { committedObserverFrontier } from "../session-ledger/coverage.js";
+import { committedObserverFrontier, hasLegacyObservationBacklog } from "../session-ledger/coverage.js";
 import { captureBranch, emitMemoryEvent, operationId, persistMemoryState } from "../telemetry.js";
 
 type ResolvedModel = Extract<ResolveResult, { ok: true }>;
@@ -146,7 +146,8 @@ function stageDue(
 }
 
 function anyStageDue(entries: Entry[], runtime: Runtime, currentTokens: number | undefined): boolean {
-	return stageDue(entries, runtime, currentTokens, OM_OBSERVATIONS_RECORDED, rawTokensSinceObservationCoverage, runtime.config.observeAfterTokens)
+	return hasLegacyObservationBacklog(entries)
+		|| stageDue(entries, runtime, currentTokens, OM_OBSERVATIONS_RECORDED, rawTokensSinceObservationCoverage, runtime.config.observeAfterTokens)
 		|| stageDue(entries, runtime, currentTokens, OM_REFLECTIONS_RECORDED, rawTokensSinceReflectionCoverage, runtime.config.reflectAfterTokens);
 }
 
@@ -406,9 +407,10 @@ async function runObserverStage(
 ): Promise<StageOutcome> {
 	const entries = ctx.sessionManager.getBranch() as Entry[];
 	const currentTokens = realContextTokens(ctx);
-	const real = currentTokens !== undefined ? realTokensSinceAnchor(entries, OM_OBSERVATIONS_RECORDED, currentTokens) : undefined;
-	const tokens = real !== undefined ? real : rawTokensSinceObservationCoverage(entries); // fallback: no usage baseline / basis change
-	if (tokens < runtime.config.observeAfterTokens) return "continue";
+	const recoveringLegacy = hasLegacyObservationBacklog(entries);
+	const real = !recoveringLegacy && currentTokens !== undefined ? realTokensSinceAnchor(entries, OM_OBSERVATIONS_RECORDED, currentTokens) : undefined;
+	const tokens = real !== undefined ? real : rawTokensSinceObservationCoverage(entries);
+	if (!recoveringLegacy && tokens < runtime.config.observeAfterTokens) return "continue";
 
 	const currentBranch = captureBranch(runtime, ctx);
 	const sessionMetadata = debugSessionMetadata(ctx);
@@ -457,7 +459,14 @@ async function runObserverStage(
 		sourceEntryIds,
 		estimatedTokens: chunkTokens,
 		truncatedSourceEntryIds,
+		incompleteSourceEntryIds,
 	} = serializeSourceAddressedBranchEntries(backlogEntries, { maxTokens: maxChunkTokens });
+	if (incompleteSourceEntryIds.length > 0) {
+		const failure = "unsupported_source: source payload cannot be completely represented for the text-only observer";
+		emitMemoryEvent(pi, ctx, "memory.observer.failed", { operationId: operationId(), ...workerMetadata(resolved), incompleteSourceEntryIds, failure });
+		persistMemoryState(pi, ctx);
+		throw new Error(failure);
+	}
 	if (!chunk.trim() || sourceEntryIds.length === 0) return "continue";
 	const coversUpToId = sourceEntryIds.at(-1);
 	if (!coversUpToId) return "continue";

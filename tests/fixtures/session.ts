@@ -155,7 +155,7 @@ export function reflection(
 
 export function observationsRecordedEntry(
 	id: string,
-	args: { observations: TestObservation[]; coversUpToId: string },
+	args: { observations: TestObservation[]; coversUpToId: string; coverage?: { version: 1; fromExclusiveId: string | null; sourceEntryIds: string[]; truncatedSourceEntryIds: string[] } },
 	overrides: Partial<TestEntry> = {},
 ): TestEntry {
 	return {
@@ -164,7 +164,9 @@ export function observationsRecordedEntry(
 		parentId: null,
 		timestamp: DEFAULT_TIMESTAMP,
 		customType: V3_OBSERVATIONS_RECORDED,
-		data: args,
+		// Default fixture models one completely observed source at branch root.
+		// Multi-source and incremental commits must supply their actual input range.
+		data: { ...args, coverage: args.coverage ?? { version: 1, fromExclusiveId: null, sourceEntryIds: [args.coversUpToId], truncatedSourceEntryIds: [] } },
 		...overrides,
 	};
 }
