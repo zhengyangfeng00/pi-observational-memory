@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { runDropper } from "../agents/dropper/agent.js";
 import { observationPoolMetrics } from "../agents/dropper/pool.js";
-import { ObserverStreamError, runObserver } from "../agents/observer/agent.js";
+import { runObserver } from "../agents/observer/agent.js";
 import { runReflector } from "../agents/reflector/agent.js";
 import { debugLog, withDebugLogContext } from "../debug-log.js";
 import { resolveObserverChunkMaxTokens } from "../config.js";
@@ -31,7 +31,48 @@ import {
 	type V3MemoryCustomType,
 } from "../session-ledger/index.js";
 
+import { committedObserverFrontier } from "../session-ledger/coverage.js";
+import { captureBranch, emitMemoryEvent, operationId, persistMemoryState } from "../telemetry.js";
+
 type ResolvedModel = Extract<ResolveResult, { ok: true }>;
+
+async function trackedWorker<T>(
+	pi: ExtensionAPI, ctx: ConsolidationCtx, stage: ConsolidationPhase,
+	current: () => boolean, metadata: Record<string, unknown>,
+	work: (commit: (customType: string, data: unknown) => void) => Promise<T>,
+): Promise<T> {
+	if (!current()) throw new Error("stale worker branch before start");
+	const startedAt = Date.now();
+	const details = { operationId: operationId(), ...metadata };
+	if (stage !== "dropper") emitMemoryEvent(pi, ctx, `memory.${stage}.started`, details);
+	persistMemoryState(pi, ctx);
+	let committed = false;
+	let itemCount = 0;
+	try {
+		const result = await work((customType, data) => {
+			if (!current()) throw new Error("stale worker branch; result discarded");
+			appendEntry(pi, customType, data);
+			committed = true;
+			const record = data as { observations?: unknown[]; reflections?: unknown[]; observationIds?: unknown[] };
+			itemCount += (record.observations ?? record.reflections ?? record.observationIds ?? []).length;
+		});
+		if (!current()) throw new Error("stale worker branch; result discarded");
+		emitMemoryEvent(pi, ctx, `memory.${stage}.completed`, { ...details, committed, itemCount, reason: committed ? "recorded" : "empty_result", durationMs: Date.now() - startedAt });
+		persistMemoryState(pi, ctx);
+		return result;
+	} catch (error) {
+		if (current()) {
+			emitMemoryEvent(pi, ctx, `memory.${stage}.failed`, { ...details, committed, durationMs: Date.now() - startedAt, failure: error instanceof Error ? error.message : String(error) });
+			persistMemoryState(pi, ctx);
+		}
+		throw error;
+	}
+}
+
+function workerMetadata(resolved: ResolvedModel): Record<string, unknown> {
+	const model = resolved.model as { provider?: string; id?: string };
+	return { model: { provider: model.provider ?? null, id: model.id ?? null }, fallbackUsed: resolved.fallbackUsed === true };
+}
 
 type ConsolidationCtx = {
 	cwd: string;
@@ -166,6 +207,7 @@ function observerChunkContextWindow(runtime: Runtime, ctx: ConsolidationCtx, res
 }
 
 type ModelResolver = {
+	failureReason: () => string | undefined;
 	resolve: (stage: ConsolidationPhase) => Promise<ResolvedModel | undefined>;
 	/** Resolve the configured fallback, caching it for the rest of the pass. */
 	resolveFallback: (stage: ConsolidationPhase) => Promise<ResolvedModel | undefined>;
@@ -227,7 +269,7 @@ function makeModelResolver(runtime: Runtime, ctx: ConsolidationCtx): ModelResolv
 		return resolved;
 	};
 
-	return { resolve, resolveFallback };
+	return { resolve, resolveFallback, failureReason: () => cached && !cached.ok ? cached.reason : undefined };
 }
 
 /**
@@ -243,7 +285,9 @@ async function runStageWithFallback<T>(
 	resolved: ResolvedModel,
 	resolver: ModelResolver,
 	work: (model: ResolvedModel) => Promise<T>,
+	modelAttempts: Record<string, unknown>[],
 ): Promise<T> {
+	modelAttempts.push(workerMetadata(resolved));
 	try {
 		return await work(resolved);
 	} catch (primaryError) {
@@ -262,6 +306,7 @@ async function runStageWithFallback<T>(
 				"warning",
 			);
 		}
+		modelAttempts.push(workerMetadata(fallback));
 		return await work(fallback);
 	}
 }
@@ -321,12 +366,14 @@ export async function runConsolidationPipeline(
 	ctx: ConsolidationCtx,
 ): Promise<void> {
 	const resolver = makeModelResolver(runtime, ctx);
+	const currentPipeline = captureBranch(runtime, ctx);
 
 	runtime.consolidationPhase = "observer";
 	try {
 		const observerOutcome = await runObserverStage(pi, runtime, ctx, resolver);
 		if (observerOutcome === "abort") return;
 	} catch (error) {
+		if (!currentPipeline()) return;
 		debugLog("observer.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "observer", error) });
 		return;
 	}
@@ -337,6 +384,7 @@ export async function runConsolidationPipeline(
 		reflectorResult = await runReflectorStage(pi, runtime, ctx, resolver);
 		if (reflectorResult.outcome === "abort") return;
 	} catch (error) {
+		if (!currentPipeline()) return;
 		debugLog("reflector.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "reflector", error) });
 		return;
 	}
@@ -345,6 +393,7 @@ export async function runConsolidationPipeline(
 	try {
 		await runDropperStage(pi, runtime, ctx, resolver, reflectorResult.sameRunReflections, reflectorResult.effectiveReflectionCoverageId);
 	} catch (error) {
+		if (!currentPipeline()) return;
 		debugLog("dropper.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "dropper", error) });
 	}
 }
@@ -361,6 +410,7 @@ async function runObserverStage(
 	const tokens = real !== undefined ? real : rawTokensSinceObservationCoverage(entries); // fallback: no usage baseline / basis change
 	if (tokens < runtime.config.observeAfterTokens) return "continue";
 
+	const currentBranch = captureBranch(runtime, ctx);
 	const sessionMetadata = debugSessionMetadata(ctx);
 	const sessionIdentity = sessionMetadata.sessionId ?? sessionMetadata.sessionFile;
 	const coverageId = latestCoverageMarkerId(entries, OM_OBSERVATIONS_RECORDED);
@@ -386,7 +436,12 @@ async function runObserverStage(
 	// Resolve the model before building the chunk: the default chunk cap
 	// derives from the resolved model's context window.
 	const resolved = await resolver.resolve("observer");
-	if (!resolved) return "abort";
+	if (!currentBranch()) return "abort";
+	if (!resolved) {
+		emitMemoryEvent(pi, ctx, "memory.observer.failed", { operationId: operationId(), reason: "model_unavailable", failure: resolver.failureReason() });
+		persistMemoryState(pi, ctx);
+		return "abort";
+	}
 
 	const lastCoverageIdx = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
 	const backlogEntries = sourceEntriesAfter(entries, lastCoverageIdx);
@@ -436,9 +491,13 @@ async function runObserverStage(
 		priorObservations: priorObservations.length,
 	});
 
-	let observations: Observation[] | undefined;
-	try {
-		observations = await runStageWithFallback(ctx, "observer", resolved, resolver, (worker) => runObserver({
+	const modelAttempts: Record<string, unknown>[] = [];
+	return trackedWorker<StageOutcome>(pi, ctx, "observer", currentBranch, {
+		...workerMetadata(resolved), modelAttempts, sourceEntryIds, fromExclusiveId: coverageId ?? null,
+		coversUpToId, chunkTokens, truncatedSourceEntryIds,
+	}, async (commit) => {
+		if (truncatedSourceEntryIds.length > 0) throw new Error("incomplete_source: observer chunk contains an excerpt; raise observerChunkMaxTokens to observe the full source");
+		const observations = await runStageWithFallback(ctx, "observer", resolved, resolver, (worker) => runObserver({
 			model: worker.model as any,
 			apiKey: worker.apiKey,
 			headers: worker.headers,
@@ -451,43 +510,41 @@ async function runObserverStage(
 			maxOutputTokens: runtime.config.agentMaxTokens,
 			thinkingLevel: workerThinkingLevel(runtime, worker),
 			modelRegistry: ctx.modelRegistry,
-		}));
-	} catch (error) {
-		if (error instanceof ObserverStreamError) {
-			// API/stream failure is not a clean empty (#32): surface it as a real
-			// failure instead of the "no observations" path. Coverage stays put.
-			runtime.recordConsolidationStageError(ctx, "observer", error);
-			return "abort";
+		}), modelAttempts);
+		if (!currentBranch()) throw new Error("stale worker branch; result discarded");
+		if (!observations || observations.length === 0) {
+			// Deliberate empty backs off over the same uncovered span.
+			debugLog("observer.empty", { coversUpToId });
+			runtime.observerEmptyBackoff = { sessionIdentity, coverageId, tokensAtEmpty: tokens };
+			if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
+				"Observational memory: observer found nothing new in this chunk (coverage unchanged; will retry later)",
+				"info",
+			);
+			return "continue";
 		}
-		throw error;
-	}
-	if (!observations || observations.length === 0) {
-		// Deliberate empty: routine info, not a warning, and back off re-fires
-		// over the same span (#23).
-		debugLog("observer.empty", { coversUpToId });
-		runtime.observerEmptyBackoff = { sessionIdentity, coverageId, tokensAtEmpty: tokens };
+		runtime.observerEmptyBackoff = undefined;
+
+		const data = buildObservationsRecordedData(observations, coversUpToId);
+		if (!data) return "continue";
+		debugLog("observer.records", {
+			count: observations.length,
+			observationTokens: observations.reduce((sum, observation) => sum + observation.tokenCount, 0),
+			coversUpToId,
+		});
+		const currentEntries = ctx.sessionManager.getBranch() as Entry[];
+		if (latestCoverageMarkerId(currentEntries, OM_OBSERVATIONS_RECORDED) !== coverageId) throw new Error("observer_coverage_changed: result discarded");
+		const record = { ...data, coverage: { version: 1 as const, fromExclusiveId: coverageId ?? null, sourceEntryIds, truncatedSourceEntryIds } };
+		if (committedObserverFrontier([...currentEntries, { type: "custom", id: operationId(), customType: OM_OBSERVATIONS_RECORDED, data: record }]).id !== coversUpToId) {
+			throw new Error("invalid_observer_coverage: result does not identify a complete contiguous source range");
+		}
+		commit(OM_OBSERVATIONS_RECORDED, record);
+		debugLog("observer.appended", { count: observations.length, coversUpToId });
 		if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
-			"Observational memory: observer found nothing new in this chunk (coverage unchanged; will retry later)",
+			`Observational memory: ${observations.length} observation${observations.length === 1 ? "" : "s"} recorded`,
 			"info",
 		);
 		return "continue";
-	}
-	runtime.observerEmptyBackoff = undefined;
-
-	const data = buildObservationsRecordedData(observations, coversUpToId);
-	if (!data) return "continue";
-	debugLog("observer.records", {
-		count: observations.length,
-		observationTokens: observations.reduce((sum, observation) => sum + observation.tokenCount, 0),
-		coversUpToId,
 	});
-	appendEntry(pi, OM_OBSERVATIONS_RECORDED, data);
-	debugLog("observer.appended", { count: observations.length, coversUpToId });
-	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
-		`Observational memory: ${observations.length} observation${observations.length === 1 ? "" : "s"} recorded`,
-		"info",
-	);
-	return "continue";
 }
 
 async function runReflectorStage(
@@ -509,32 +566,40 @@ async function runReflectorStage(
 		`Observational memory: reflector running (~${reflectionTokens.toLocaleString()} tokens)`,
 		"info",
 	);
+	const currentBranch = captureBranch(runtime, ctx);
 	const resolved = await resolver.resolve("reflector");
-	if (!resolved) return { outcome: "abort", sameRunReflections: [] };
+	if (!currentBranch()) return { outcome: "abort", sameRunReflections: [] };
+	if (!resolved) {
+		emitMemoryEvent(pi, ctx, "memory.reflector.failed", { operationId: operationId(), reason: "model_unavailable", failure: resolver.failureReason() });
+		persistMemoryState(pi, ctx);
+		return { outcome: "abort", sameRunReflections: [] };
+	}
+	const modelAttempts: Record<string, unknown>[] = [];
+	return trackedWorker<ReflectorStageResult>(pi, ctx, "reflector", currentBranch, { ...workerMetadata(resolved), modelAttempts, coversUpToId: observationCoverageId }, async (commit) => {
+		const folded = foldLedger(entries);
+		const reflections = await runStageWithFallback(ctx, "reflector", resolved, resolver, (worker) => runReflector({
+			model: worker.model as any,
+			apiKey: worker.apiKey,
+			headers: worker.headers,
+			env: worker.env,
+			reflections: folded.reflections,
+			observations: folded.activeObservations,
+			maxTurns: runtime.config.agentMaxTurns,
+			maxOutputTokens: runtime.config.agentMaxTokens,
+			thinkingLevel: workerThinkingLevel(runtime, worker),
+			modelRegistry: ctx.modelRegistry,
+		}), modelAttempts);
+		if (!reflections) return { outcome: "continue", sameRunReflections: [] };
 
-	const folded = foldLedger(entries);
-	const reflections = await runStageWithFallback(ctx, "reflector", resolved, resolver, (worker) => runReflector({
-		model: worker.model as any,
-		apiKey: worker.apiKey,
-		headers: worker.headers,
-		env: worker.env,
-		reflections: folded.reflections,
-		observations: folded.activeObservations,
-		maxTurns: runtime.config.agentMaxTurns,
-		maxOutputTokens: runtime.config.agentMaxTokens,
-		thinkingLevel: workerThinkingLevel(runtime, worker),
-		modelRegistry: ctx.modelRegistry,
-	}));
-	if (!reflections) return { outcome: "continue", sameRunReflections: [] };
-
-	const data = buildReflectionsRecordedData(reflections, observationCoverageId);
-	if (!data) return { outcome: "continue", sameRunReflections: [] };
-	appendEntry(pi, OM_REFLECTIONS_RECORDED, data);
-	return {
-		outcome: "continue",
-		sameRunReflections: reflections,
-		effectiveReflectionCoverageId: data.coversUpToId,
-	};
+		const data = buildReflectionsRecordedData(reflections, observationCoverageId);
+		if (!data) return { outcome: "continue", sameRunReflections: [] };
+		commit(OM_REFLECTIONS_RECORDED, data);
+		return {
+			outcome: "continue",
+			sameRunReflections: reflections,
+			effectiveReflectionCoverageId: data.coversUpToId,
+		};
+	});
 }
 
 async function runDropperStage(
@@ -584,31 +649,42 @@ async function runDropperStage(
 		`Observational memory: dropper running after reflection — active observation pool ~${metrics.observationTokens.toLocaleString()} / ${metrics.targetTokens.toLocaleString()} target tokens (${Math.round(metrics.fullness * 100).toLocaleString()}%)`,
 		"info",
 	);
+	const currentBranch = captureBranch(runtime, ctx);
 	const resolved = await resolver.resolve("dropper");
-	if (!resolved) return "abort";
-
-	const reflectionsForDropper = mergeReflections(folded.reflections, sameRunReflections);
-	const droppedIds = await runStageWithFallback(ctx, "dropper", resolved, resolver, (worker) => runDropper({
-		model: worker.model as any,
-		apiKey: worker.apiKey,
-		headers: worker.headers,
-		env: worker.env,
-		reflections: reflectionsForDropper,
-		observations: folded.activeObservations,
-		targetTokens: runtime.config.observationsPoolTargetTokens,
-		maxTurns: runtime.config.agentMaxTurns,
-		maxOutputTokens: runtime.config.agentMaxTokens,
-		thinkingLevel: workerThinkingLevel(runtime, worker),
-		modelRegistry: ctx.modelRegistry,
-	}));
-	const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, sameRunReflectionCoverageId);
-	const data = coversUpToId && droppedIds ? buildObservationsDroppedData(droppedIds, coversUpToId) : undefined;
-	debugLog("dropper.append", {
-		droppedIdsCount: droppedIds?.length ?? 0,
-		coversUpToId,
-		dataBuilt: data !== undefined,
-		appended: data !== undefined,
+	if (!currentBranch()) return "abort";
+	if (!resolved) {
+		emitMemoryEvent(pi, ctx, "memory.dropper.failed", { operationId: operationId(), reason: "model_unavailable", failure: resolver.failureReason() });
+		persistMemoryState(pi, ctx);
+		return "abort";
+	}
+	const modelAttempts: Record<string, unknown>[] = [];
+	return trackedWorker<StageOutcome>(pi, ctx, "dropper", currentBranch, {
+		...workerMetadata(resolved), modelAttempts, coversUpToId: observationCoverageId,
+		activeObservationCount: metrics.activeObservationCount, targetTokens: metrics.targetTokens,
+	}, async (commit) => {
+		const reflectionsForDropper = mergeReflections(folded.reflections, sameRunReflections);
+		const droppedIds = await runStageWithFallback(ctx, "dropper", resolved, resolver, (worker) => runDropper({
+			model: worker.model as any,
+			apiKey: worker.apiKey,
+			headers: worker.headers,
+			env: worker.env,
+			reflections: reflectionsForDropper,
+			observations: folded.activeObservations,
+			targetTokens: runtime.config.observationsPoolTargetTokens,
+			maxTurns: runtime.config.agentMaxTurns,
+			maxOutputTokens: runtime.config.agentMaxTokens,
+			thinkingLevel: workerThinkingLevel(runtime, worker),
+			modelRegistry: ctx.modelRegistry,
+		}), modelAttempts);
+		const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, sameRunReflectionCoverageId);
+		const data = coversUpToId && droppedIds ? buildObservationsDroppedData(droppedIds, coversUpToId) : undefined;
+		debugLog("dropper.append", {
+			droppedIdsCount: droppedIds?.length ?? 0,
+			coversUpToId,
+			dataBuilt: data !== undefined,
+			appended: data !== undefined,
+		});
+		if (data) commit(OM_OBSERVATIONS_DROPPED, data);
+		return "continue";
 	});
-	if (data) appendEntry(pi, OM_OBSERVATIONS_DROPPED, data);
-	return "continue";
 }

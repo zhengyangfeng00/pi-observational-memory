@@ -1,4 +1,5 @@
 import { estimateEntryTokens } from "../tokens.js";
+import { committedObserverFrontier } from "./coverage.js";
 import {
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
@@ -43,6 +44,7 @@ function isValidCoverageEntry(entry: Entry, customType: V3MemoryCustomType): ent
 }
 
 export function latestCoverageIndex(entries: Entry[], customType: V3MemoryCustomType): number {
+	if (customType === OM_OBSERVATIONS_RECORDED) return committedObserverFrontier(entries).index;
 	const idToIndex = entryIndexById(entries);
 	let latest = -1;
 
@@ -57,6 +59,7 @@ export function latestCoverageIndex(entries: Entry[], customType: V3MemoryCustom
 }
 
 export function latestCoverageMarkerId(entries: Entry[], customType: V3MemoryCustomType): string | undefined {
+	if (customType === OM_OBSERVATIONS_RECORDED) return committedObserverFrontier(entries).id ?? undefined;
 	const idToIndex = entryIndexById(entries);
 	let latestIndex = -1;
 	let latestMarkerId: string | undefined;

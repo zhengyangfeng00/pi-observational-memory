@@ -115,6 +115,16 @@ export class Runtime {
 	consolidationPhase: ConsolidationPhase | undefined;
 	compactInFlight = false;
 	compactHookInFlight = false;
+	/** Invalidates async commits and deferred requests across session navigation/replacement. */
+	memoryEpoch = 0;
+	/** Distinguishes pre-hook request failures from hook terminal lifecycle events. */
+	memoryCompactionSequence = 0;
+	memoryCompactionRequest: {
+		operationId: string;
+		startedAt: number;
+		current: () => boolean;
+		metadata: Record<string, unknown>;
+	} | undefined;
 	resolveFailureNotified = false;
 	lastObserverError: string | undefined;
 	lastReflectorError: string | undefined;

@@ -15,6 +15,7 @@ vi.mock("../src/agents/dropper/agent.js", () => ({ runDropper: mockAgents.runDro
 
 import { ObserverStreamError } from "../src/agents/observer/agent.js";
 import { registerConsolidationTrigger } from "../src/hooks/consolidation-trigger.js";
+import { registerCompactionHook } from "../src/hooks/compaction-hook.js";
 import {
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
@@ -55,11 +56,17 @@ function setup(args: {
 	let entries = [...args.entries];
 	let sessionId = args.sessionId ?? "session-1";
 	const handlers: Record<string, ((event: unknown, ctx: any) => void) | undefined> = {};
+	// Keep existing ledger assertions separate from the new telemetry/coverage contract.
+	const ledgerAppend = vi.fn();
 	const pi = {
 		on: vi.fn((eventName: string, cb: (event: unknown, ctx: any) => void) => {
 			handlers[eventName] = cb;
 		}),
 		appendEntry: vi.fn((customType: string, data: unknown) => {
+			if (customType.startsWith("om.")) {
+				const { coverage: _coverage, ...legacyData } = data as any;
+				ledgerAppend(customType, legacyData);
+			}
 			const id = `appended-${pi.appendEntry.mock.calls.length}`;
 			entries = [...entries, { type: "custom", id, parentId: entries.at(-1)?.id ?? null, timestamp: "2026-05-02T10:00:00.000Z", customType, data }];
 			return args.appendEntryReturnsId === false ? undefined : id;
@@ -118,7 +125,8 @@ function setup(args: {
 		},
 	};
 	return {
-		pi,
+		pi: { ...pi, appendEntry: ledgerAppend },
+		telemetryPi: pi,
 		runtime,
 		ctx,
 		fire: (eventName = "turn_end") => handlers[eventName]!(undefined, ctx),
@@ -131,6 +139,7 @@ function setup(args: {
 		setSessionId: (next: string) => {
 			sessionId = next;
 		},
+		setEntries: (next: TestEntry[]) => { entries = next; },
 		getEntries: () => entries,
 	};
 }
@@ -1012,7 +1021,7 @@ describe("observer chunk cap", () => {
 		expect(pi.appendEntry).toHaveBeenNthCalledWith(2, OM_OBSERVATIONS_RECORDED, { observations: [second], coversUpToId: "raw-2" });
 	});
 
-	it("bounds one oversized tool result, preserves provenance, and continues on the next run", async () => {
+	it("blocks excerpt-only observation until the full source fits the input budget", async () => {
 		const first = observation("333333333333", { sourceEntryIds: ["raw-huge"], tokenCount: 4 });
 		const second = observation("555555555555", { sourceEntryIds: ["raw-next"], tokenCount: 4 });
 		mockAgents.runObserver.mockResolvedValueOnce([first]).mockResolvedValueOnce([second]);
@@ -1039,22 +1048,18 @@ describe("observer chunk cap", () => {
 		fire();
 		await runLaunchedWork();
 
-		const firstCall = mockAgents.runObserver.mock.calls[0][0];
-		expect(firstCall.allowedSourceEntryIds).toEqual(["raw-huge"]);
-		expect(firstCall.chunk).toContain("HEAD:");
-		expect(firstCall.chunk).toContain(":TAIL");
-		expect(firstCall.chunk).toContain("middle omitted: source exceeds observer input budget");
-		expect(firstCall.chunk).not.toContain("raw-next");
-		expect(pi.appendEntry).toHaveBeenNthCalledWith(1, OM_OBSERVATIONS_RECORDED, { observations: [first], coversUpToId: "raw-huge" });
+		expect(mockAgents.runObserver).not.toHaveBeenCalled();
+		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(runtime.lastObserverError).toContain("incomplete_source");
 
-		// The source id still points at the full ledger entry; the next run starts
-		// after it instead of retrying the oversized input forever.
+		// Raising the cap makes the same original source observable in full.
+		runtime.config.observerChunkMaxTokens = 1_000;
 		runtime.consolidationInFlight = false;
 		fire();
 		await runLaunchedWork();
-
-		expect(mockAgents.runObserver).toHaveBeenNthCalledWith(2, expect.objectContaining({ allowedSourceEntryIds: ["raw-next"] }));
-		expect(pi.appendEntry).toHaveBeenNthCalledWith(2, OM_OBSERVATIONS_RECORDED, { observations: [second], coversUpToId: "raw-next" });
+		expect(mockAgents.runObserver).toHaveBeenCalledWith(expect.objectContaining({ allowedSourceEntryIds: ["raw-huge", "raw-next"] }));
+		expect(mockAgents.runObserver.mock.calls[0][0].chunk).toContain(hugeText);
+		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, { observations: [first], coversUpToId: "raw-next" });
 	});
 
 	it("derives the cap from the resolved model's context window when not configured", async () => {
@@ -1073,5 +1078,157 @@ describe("observer chunk cap", () => {
 
 		expect(mockAgents.runObserver).toHaveBeenCalledWith(expect.objectContaining({ allowedSourceEntryIds: ["raw-1"] }));
 		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, expect.objectContaining({ coversUpToId: "raw-1" }));
+	});
+});
+
+describe("worker branch races and persisted lifecycle", () => {
+	function deferred<T>() {
+		let resolve!: (value: T) => void;
+		const promise = new Promise<T>((done) => { resolve = done; });
+		return { promise, resolve };
+	}
+	const obs = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"] });
+	const events = (s: ReturnType<typeof setup>) => s.telemetryPi.appendEntry.mock.calls
+		.filter(([type]) => type === "observational-memory:event").map(([, data]) => data as any);
+	const states = (s: ReturnType<typeof setup>) => s.telemetryPi.appendEntry.mock.calls
+		.filter(([type]) => type === "observational-memory:state").map(([, data]) => data as any);
+
+	it("persists started before completion, commits coverage before the terminal event, and separates memory state", async () => {
+		const pending = deferred<any>();
+		mockAgents.runObserver.mockReturnValue(pending.promise);
+		const s = setup({ entries: [textCustomMessage("raw-1", "aaaa")], reflectAfterTokens: 999 });
+		s.fire();
+		const work = s.runLaunchedWork();
+		await vi.waitFor(() => expect(mockAgents.runObserver).toHaveBeenCalled());
+		expect(events(s)).toMatchObject([{ version: 1, type: "memory.observer.started", metadata: { observedThrough: null, sourceEntryIds: ["raw-1"] } }]);
+		expect(states(s).at(-1)).toMatchObject({ observer: "running", observations: [], observedThrough: null });
+		pending.resolve([obs]);
+		await work;
+		expect(events(s).at(-1)).toMatchObject({ type: "memory.observer.completed", metadata: { committed: true, itemCount: 1, observedThrough: "raw-1", durationMs: expect.any(Number), modelAttempts: [expect.any(Object)] } });
+		expect(events(s)[0].metadata.modelAttempts).toEqual([]);
+		expect(events(s)[0].metadata.operationId).toBe(events(s)[1].metadata.operationId);
+		expect(new Date(events(s)[0].timestamp).toISOString()).toBe(events(s)[0].timestamp);
+		expect(states(s).at(-1)).toMatchObject({ version: 1, observer: "idle", observations: [obs], observedThrough: "raw-1", rawTailTokens: 0 });
+		expect(events(s).some((event) => JSON.stringify(event).includes(obs.content))).toBe(false);
+		expect(s.telemetryPi.appendEntry).toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, expect.objectContaining({ coverage: { version: 1, fromExclusiveId: null, sourceEntryIds: ["raw-1"], truncatedSourceEntryIds: [] } }));
+	});
+
+	it("allows appended turns but never attributes them to the in-flight observed range", async () => {
+		const pending = deferred<any>();
+		mockAgents.runObserver.mockReturnValue(pending.promise);
+		const s = setup({ entries: [textCustomMessage("raw-1", "aaaa")], reflectAfterTokens: 999 });
+		s.fire(); const work = s.runLaunchedWork();
+		await vi.waitFor(() => expect(mockAgents.runObserver).toHaveBeenCalled());
+		s.addEntries(textCustomMessage("raw-2", "bbbbbbbb"));
+		pending.resolve([obs]); await work;
+		expect(states(s).at(-1)).toMatchObject({ observedThrough: "raw-1", rawTailTokens: 2 });
+	});
+
+	it("clamps immediately during an observer race, then uses the committed frontier on a later compaction", async () => {
+		const pending = deferred<any>();
+		mockAgents.runObserver.mockReturnValueOnce(pending.promise);
+		const s = setup({ entries: [textCustomMessage("raw-1", "aaaa"), observationsRecordedEntry("old-commit", { observations: [obs], coversUpToId: "raw-1" }), textCustomMessage("raw-2", "bbbb"), textCustomMessage("raw-3", "cccc")], reflectAfterTokens: 999 });
+		registerCompactionHook(s.telemetryPi as any, s.runtime as any);
+		const hook = s.telemetryPi.on.mock.calls.find(([name]) => name === "session_before_compact")![1] as any;
+		const compact = () => hook({ preparation: { firstKeptEntryId: "raw-3", tokensBefore: 100 }, branchEntries: s.getEntries() }, s.ctx);
+		s.fire(); const work = s.runLaunchedWork();
+		await vi.waitFor(() => expect(mockAgents.runObserver).toHaveBeenCalled());
+		const during = await compact();
+		expect(during.compaction.firstKeptEntryId).toBe("raw-2");
+		expect(during.compaction.details.observations).toEqual([obs]);
+		const fresh = observation("bbbbbbbbbbbb", { sourceEntryIds: ["raw-2"] });
+		pending.resolve([fresh]); await work;
+		const after = await compact();
+		expect(after.compaction.firstKeptEntryId).toBe("raw-3");
+		expect(after.compaction.details.observations).toEqual([obs, fresh]);
+	});
+
+	it.each(["session", "branch", "epoch", "context_edit"])("discards observer output after a %s change", async (change) => {
+		const pending = deferred<any>();
+		mockAgents.runObserver.mockReturnValue(pending.promise);
+		const s = setup({ entries: [textCustomMessage("raw-1", "aaaa")], reflectAfterTokens: 999 });
+		s.fire(); const work = s.runLaunchedWork();
+		await vi.waitFor(() => expect(mockAgents.runObserver).toHaveBeenCalled());
+		if (change === "session") s.setSessionId("session-2");
+		if (change === "branch") s.setEntries([textCustomMessage("foreign", "bbbb")]);
+		if (change === "epoch") (s.runtime as any).memoryEpoch = 1; // navigation away and back also invalidates work
+		if (change === "context_edit") s.addEntries({ type: "context_edit", id: "edit", parentId: null, timestamp: "", targetId: "raw-1" } as any);
+		pending.resolve([obs]); await work;
+		expect(s.pi.appendEntry).not.toHaveBeenCalled();
+		expect(events(s).filter((event) => event.type === "memory.observer.completed")).toHaveLength(0);
+		expect(mockAgents.runReflector).not.toHaveBeenCalled();
+	});
+
+	it("discards a stale observer chunk even if navigation occurs during auth resolution", async () => {
+		const pending = deferred<any>();
+		const s = setup({ entries: [textCustomMessage("raw-1", "aaaa")] });
+		s.runtime.resolveModel.mockReturnValueOnce(pending.promise);
+		s.fire(); const work = s.runLaunchedWork();
+		s.setEntries([textCustomMessage("foreign", "bbbb")]);
+		pending.resolve({ ok: true, model: {}, apiKey: "key" }); await work;
+		expect(mockAgents.runObserver).not.toHaveBeenCalled();
+		expect(s.telemetryPi.appendEntry).not.toHaveBeenCalled();
+	});
+
+	it("rejects overlapping observer commits when another committed frontier wins the race", async () => {
+		const pending = deferred<any>();
+		mockAgents.runObserver.mockReturnValue(pending.promise);
+		const s = setup({ entries: [textCustomMessage("raw-1", "aaaa")], reflectAfterTokens: 999 });
+		s.fire(); const work = s.runLaunchedWork();
+		await vi.waitFor(() => expect(mockAgents.runObserver).toHaveBeenCalled());
+		s.addEntries(observationsRecordedEntry("other-commit", { observations: [obs], coversUpToId: "raw-1" }));
+		pending.resolve([obs]); await work;
+		expect(s.pi.appendEntry).not.toHaveBeenCalled();
+		expect(events(s).at(-1)).toMatchObject({ type: "memory.observer.failed", metadata: { failure: expect.stringContaining("observer_coverage_changed"), observedThrough: "raw-1" } });
+	});
+
+	it("makes clean empty and stream failure distinct without granting coverage", async () => {
+		const empty = setup({ entries: [textCustomMessage("raw-1", "aaaa")], reflectAfterTokens: 999 });
+		empty.fire(); await empty.runLaunchedWork();
+		expect(events(empty).at(-1)).toMatchObject({ type: "memory.observer.completed", metadata: { committed: false, reason: "empty_result", observedThrough: null } });
+		mockAgents.runObserver.mockRejectedValueOnce(new ObserverStreamError("stream disconnected"));
+		const failed = setup({ entries: [textCustomMessage("raw-1", "aaaa")], reflectAfterTokens: 999 });
+		failed.fire(); await failed.runLaunchedWork();
+		expect(events(failed).at(-1)).toMatchObject({ type: "memory.observer.failed", metadata: { failure: expect.stringContaining("stream disconnected"), observedThrough: null } });
+		expect(states(failed).at(-1)).toMatchObject({ observer: "failed", observedThrough: null, observations: [] });
+	});
+
+	it("reports fallback model attempts without credentials", async () => {
+		const s = setup({ entries: [textCustomMessage("raw-1", "aaaa")], reflectAfterTokens: 999 });
+		s.runtime.resolveModel.mockResolvedValueOnce({ ok: true, model: { provider: "primary", id: "p" }, apiKey: "secret" } as any);
+		s.runtime.resolveFallbackModel.mockResolvedValueOnce({ ok: true, model: { provider: "fallback", id: "f" }, apiKey: "other-secret" } as any);
+		mockAgents.runObserver.mockRejectedValueOnce(Error("primary down")).mockResolvedValueOnce([obs]);
+		s.fire(); await s.runLaunchedWork();
+		expect(events(s).at(-1).metadata.modelAttempts).toMatchObject([{ model: { provider: "primary", id: "p" }, fallbackUsed: false }, { model: { provider: "fallback", id: "f" }, fallbackUsed: true }]);
+		expect(JSON.stringify(events(s))).not.toContain("secret");
+	});
+
+	it("guards reflector output across navigation and persists explicit reflector failures", async () => {
+		const pending = deferred<any>();
+		mockAgents.runReflector.mockReturnValueOnce(pending.promise);
+		const s = setup({ entries: [textCustomMessage("raw-1", "aaaa"), observationsRecordedEntry("obs", { observations: [obs], coversUpToId: "raw-1" })], observeAfterTokens: 999 });
+		s.fire(); const work = s.runLaunchedWork();
+		await vi.waitFor(() => expect(mockAgents.runReflector).toHaveBeenCalled());
+		expect(states(s).at(-1).reflector).toBe("running");
+		s.setEntries([textCustomMessage("foreign", "bbbb")]);
+		pending.resolve([reflection("bbbbbbbbbbbb", [obs.id])]); await work;
+		expect(s.pi.appendEntry).not.toHaveBeenCalled();
+		mockAgents.runReflector.mockRejectedValueOnce(Error("reflector down"));
+		const failed = setup({ entries: [textCustomMessage("raw-1", "aaaa"), observationsRecordedEntry("obs", { observations: [obs], coversUpToId: "raw-1" })], observeAfterTokens: 999 });
+		failed.fire(); await failed.runLaunchedWork();
+		expect(events(failed).at(-1)).toMatchObject({ type: "memory.reflector.failed", metadata: { failure: "reflector down" } });
+		expect(states(failed).at(-1)).toMatchObject({ reflector: "failed", reflectedThrough: null });
+	});
+
+	it("persists reflection and dropper outcomes with authoritative frontier snapshots", async () => {
+		const high = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 80 });
+		const low = observation("cccccccccccc", { sourceEntryIds: ["raw-1"], tokenCount: 20 });
+		mockAgents.runReflector.mockResolvedValueOnce([reflection("bbbbbbbbbbbb", [high.id])]);
+		mockAgents.runDropper.mockResolvedValueOnce([high.id]);
+		const s = setup({ entries: [textCustomMessage("raw-1", "aaaa"), observationsRecordedEntry("obs", { observations: [high, low], coversUpToId: "raw-1" })], observeAfterTokens: 999, observationsPoolMaxTokens: 10 });
+		s.fire(); await s.runLaunchedWork();
+		expect(events(s).map((event) => event.type)).toEqual(["memory.reflector.started", "memory.reflector.completed", "memory.dropper.completed"]);
+		expect(events(s).at(-1)).toMatchObject({ metadata: { committed: true, itemCount: 1, durationMs: expect.any(Number) } });
+		expect(states(s).at(-1)).toMatchObject({ reflectedThrough: "raw-1", observedThrough: "raw-1", reflector: "idle", observations: [low] });
 	});
 });

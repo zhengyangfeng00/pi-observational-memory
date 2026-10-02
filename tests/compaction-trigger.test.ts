@@ -6,6 +6,7 @@ import { compactionEntry, rawMessage, textCustomMessage, type TestEntry } from "
 function captureHandler(args: { compactAfterTokens?: number; compactAfterTokensMode?: "calibrated" | "ratio"; compactAfterTokensRatio?: number; passive?: boolean; compactInFlight?: boolean } = {}) {
 	let handler: ((event: unknown, ctx: unknown) => void) | undefined;
 	const pi = {
+		appendEntry: vi.fn(),
 		on: vi.fn((name: string, cb: typeof handler) => {
 			expect(name).toBe("agent_settled");
 			handler = cb;

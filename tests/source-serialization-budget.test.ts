@@ -29,6 +29,15 @@ function toolResultEntry(id: string, text: string) {
 }
 
 describe("source-addressed serialization budget", () => {
+	it("includes an explicit label for empty source rather than creating a coverage identity gap", () => {
+		const result = serializeSourceAddressedBranchEntries([
+			{ type: "message", id: "empty", message: { role: "assistant", content: [] } },
+			customEntry("next", "text"),
+		]);
+		expect(result.sourceEntryIds).toEqual(["empty", "next"]);
+		expect(result.text).toContain("[Source entry has no serializable text]");
+		expect(result.truncatedSourceEntryIds).toEqual([]);
+	});
 	it("preserves all source blocks when they fit", () => {
 		const entries = [
 			customEntry("raw-1", "first"),

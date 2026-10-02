@@ -1,172 +1,154 @@
 import { describe, expect, it, vi } from "vitest";
-
 import { registerCompactionHook } from "../src/hooks/compaction-hook.js";
-import {
-	compactionEntry,
-	memoryDetails,
-	observation,
-	observationsDroppedEntry,
-	observationsRecordedEntry,
-	oldV2CompactionDetails,
-	oldV2ObservationEntry,
-	reflection,
-	reflectionsRecordedEntry,
-	textCustomMessage,
-	type TestEntry,
-} from "./fixtures/session.js";
+import { committedObserverFrontier, safeCompactionCut } from "../src/session-ledger/coverage.js";
+import { MEMORY_EVENT, MEMORY_STATE } from "../src/telemetry.js";
+import { compactionEntry, memoryDetails, observation, observationsRecordedEntry, observationsDroppedEntry,
+	reflection, reflectionsRecordedEntry, rawMessage, textCustomMessage, type TestEntry } from "./fixtures/session.js";
 
-function setup(args: { entries: TestEntry[]; observationsPoolMaxTokens?: number; compactHookInFlight?: boolean }) {
-	let handler: ((event: unknown, ctx: unknown) => Promise<unknown>) | undefined;
-	const pi = {
-		on: vi.fn((eventName: string, cb: typeof handler) => {
-			expect(eventName).toBe("session_before_compact");
-			handler = cb;
-		}),
-		appendEntry: vi.fn(),
-	};
-	const runtime = {
-		config: {
-			observationsPoolMaxTokens: args.observationsPoolMaxTokens ?? 20_000,
-		},
-		compactHookInFlight: args.compactHookInFlight ?? false,
-		observerPromise: new Promise(() => {}),
-		resolveModel: vi.fn(() => {
-			throw new Error("resolveModel must not be called");
-		}),
-		ensureConfig: vi.fn(),
-	};
-	registerCompactionHook(pi as any, runtime as any);
-	if (!handler) throw new Error("compaction handler was not registered");
-	const ctx = {
-		cwd: "/tmp/project",
-		hasUI: true,
-		ui: { notify: vi.fn() },
-		sessionManager: { getBranch: vi.fn(() => args.entries) },
-	};
-	const run = (firstKeptEntryId = args.entries.at(-1)?.id ?? "missing") => handler!({
-		preparation: { firstKeptEntryId, tokensBefore: 123 },
-		branchEntries: args.entries,
-		signal: undefined,
-	}, ctx);
-	return { pi, runtime, ctx, run };
+function recorded(end = "raw-1", ids = ["raw-1"], overrides: Record<string, unknown> = {}) {
+	return observationsRecordedEntry("observed", { observations: [observation("aaaaaaaaaaaa", { sourceEntryIds: ids })], coversUpToId: end },
+		{ data: { observations: [observation("aaaaaaaaaaaa", { sourceEntryIds: ids })], coversUpToId: end,
+			coverage: { version: 1, fromExclusiveId: null, sourceEntryIds: ids, truncatedSourceEntryIds: [] }, ...overrides } });
 }
 
-describe("V3 compaction hook", () => {
-	it("delegates to native compaction when there is no V3 memory", async () => {
-		const entries = [textCustomMessage("raw-1", "aaaa")];
-		const { run, runtime, pi } = setup({ entries });
+function setup(initial: TestEntry[], poolMax = 20_000) {
+	let entries = initial;
+	const handlers: Record<string, (event: any, ctx: any) => any> = {};
+	const pi = { on: vi.fn((name, cb) => { handlers[name] = cb; }),
+		appendEntry: vi.fn((customType, data) => { entries = [...entries, { type: "custom", id: `telemetry-${pi.appendEntry.mock.calls.length}`, parentId: null, timestamp: "", customType, data }]; }),
+		events: { emit: vi.fn() } };
+	const runtime = { config: { observationsPoolMaxTokens: poolMax }, compactHookInFlight: false, memoryEpoch: 0,
+		ensureConfig: vi.fn(), resolveModel: vi.fn(() => { throw Error("no model calls in hook"); }) };
+	const ctx = { cwd: "/tmp/project", hasUI: true, ui: { notify: vi.fn() }, sessionManager: { getBranch: () => entries, getSessionId: () => "session" } };
+	registerCompactionHook(pi as any, runtime as any);
+	return { pi, runtime, ctx, handlers,
+		run: (firstKeptEntryId: string) => handlers.session_before_compact({ preparation: { firstKeptEntryId, tokensBefore: 123 }, branchEntries: entries, reason: "manual" }, ctx) };
+}
 
-		const result = await run("raw-1");
-
-		expect(result).toBeUndefined();
-		expect(runtime.resolveModel).not.toHaveBeenCalled();
-		expect(pi.appendEntry).not.toHaveBeenCalled();
-		expect(runtime.compactHookInFlight).toBe(false);
+describe("safe committed observer compaction", () => {
+	it("cancels empty/unobserved memory without native summarization or waiting", async () => {
+		const s = setup([textCustomMessage("raw-1", "aaa"), textCustomMessage("raw-2", "bbb")]);
+		await expect(s.run("raw-2")).resolves.toEqual({ cancel: true });
+		expect(s.runtime.resolveModel).not.toHaveBeenCalled();
+		expect(s.pi.appendEntry).toHaveBeenCalledWith(MEMORY_EVENT, expect.objectContaining({ type: "memory.compaction.blocked_on_observer", metadata: expect.objectContaining({ reason: "no_committed_observer_coverage" }) }));
+	});
+	it("clamps Pi's later desired cutoff to the first unobserved source", async () => {
+		const s = setup([textCustomMessage("raw-1", "aaa"), recorded(), textCustomMessage("raw-2", "bbb"), textCustomMessage("raw-3", "ccc")]);
+		const result = await s.run("raw-3");
+		expect(result.compaction.firstKeptEntryId).toBe("raw-2");
+		expect(result.compaction.summary).toContain("aaaaaaaaaaaa");
+		expect(s.runtime.compactHookInFlight).toBe(false);
+	});
+	it("includes a committed batch spanning beyond Pi's earlier desired cutoff", async () => {
+		const s = setup([textCustomMessage("raw-1", "a"), textCustomMessage("raw-2", "b"), textCustomMessage("raw-3", "c"), recorded("raw-3", ["raw-1", "raw-2", "raw-3"])]);
+		const result = await s.run("raw-2");
+		expect(result.compaction.firstKeptEntryId).toBe("raw-2");
+		expect(result.compaction.details.observations).toHaveLength(1);
+	});
+	it("backs up from an uncovered tool result to its assistant call", () => {
+		const entries = [rawMessage("raw-1", "a"), rawMessage("call", "b", { message: { role: "assistant", content: [{ type: "toolCall", id: "tool" }] } }),
+			recorded("call", ["raw-1", "call"]), rawMessage("tool", "", { message: { role: "toolResult", toolCallId: "tool" } }), rawMessage("next", "c")];
+		expect(safeCompactionCut(entries, "next")).toMatchObject({ ok: true, firstKeptEntryId: "call", clamped: true });
+	});
+	it("does not cut away the assistant when doing so would split an uncovered tool result", () => {
+		const entries = [rawMessage("call", "b", { message: { role: "assistant" } }), recorded("call", ["call"]), rawMessage("tool", "", { message: { role: "toolResult" } }), rawMessage("next", "c")];
+		expect(safeCompactionCut(entries, "next")).toMatchObject({ ok: false, reason: "no_removable_covered_source" });
+	});
+	it.each(["missing", "raw-1"])("cancels unknown/no-progress desired boundary %s", async (desired) => {
+		const s = setup([textCustomMessage("raw-1", "a"), recorded(), textCustomMessage("raw-2", "b")]);
+		await expect(s.run(desired)).resolves.toEqual({ cancel: true });
+	});
+	it("does not trust a running observer's target or unrelated telemetry snapshot", async () => {
+		const s = setup([textCustomMessage("raw-1", "a"), { type: "custom", id: "state", parentId: null, timestamp: "", customType: MEMORY_STATE, data: { observedThrough: "raw-1" } }, textCustomMessage("raw-2", "b")]);
+		(s.runtime as any).consolidationInFlight = true;
+		await expect(s.run("raw-2")).resolves.toEqual({ cancel: true });
+	});
+	it("uses newly committed observer coverage on the next attempt", async () => {
+		const entries = [textCustomMessage("raw-1", "a"), textCustomMessage("raw-2", "b")];
+		const s = setup(entries);
+		await expect(s.run("raw-2")).resolves.toEqual({ cancel: true });
+		// The hook reads a fresh branch snapshot each time, not an in-flight cache.
+		const ready = setup([...entries, recorded()]);
+		expect((await ready.run("raw-2")).compaction.firstKeptEntryId).toBe("raw-2");
+	});
+	it("preserves normal and full-fold reflection/drop behavior", async () => {
+		const obs = observation("aaaaaaaaaaaa");
+		const ref = reflection("eeeeeeeeeeee", [obs.id]);
+		const entries = [textCustomMessage("raw-1", "a"), recorded(), reflectionsRecordedEntry("ref", { reflections: [ref], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "b")];
+		expect((await setup(entries, 100).run("raw-2")).compaction.details.reflections).toEqual([]);
+		const full = await setup(entries, 1).run("raw-2");
+		expect(full.compaction.details).toMatchObject({ fullFold: true, reflections: [ref] });
+		const empty = setup([...entries, observationsDroppedEntry("drop", { observationIds: [obs.id], coversUpToId: "raw-1" })], 1);
+		expect((await empty.run("raw-2")).compaction.summary).toContain("eeeeeeeeeeee");
+	});
+	it("cancels when projection is empty even though observer coverage exists", async () => {
+		const entries = [textCustomMessage("raw-1", "a"), recorded(), observationsDroppedEntry("drop", { observationIds: ["aaaaaaaaaaaa"], coversUpToId: "raw-1" }), textCustomMessage("raw-2", "b")];
+		await expect(setup(entries, 1).run("raw-2")).resolves.toEqual({ cancel: true });
+	});
+	it("blocks replacement-edited prefixes but permits edited retained source and later omission", () => {
+		const base = [textCustomMessage("raw-1", "a"), recorded(), textCustomMessage("raw-2", "b")];
+		const edit = { type: "context_edit", id: "edit", targetId: "raw-1", replacement: "new text" };
+		expect(safeCompactionCut([...base, edit], "raw-2")).toMatchObject({ ok: false, reason: "context_edited_source" });
+		expect(safeCompactionCut([...base, { ...edit, targetId: "raw-2" }], "raw-2")).toMatchObject({ ok: true });
+		expect(safeCompactionCut([...base, edit, { ...edit, id: "omit", replacement: null }], "raw-2")).toMatchObject({ ok: true });
 	});
 
-	it("first normal compaction writes covered observations without orphan reflections", async () => {
-		const obs1 = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 });
-		const ref1 = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"]);
-		const entries = [
-			textCustomMessage("raw-1", "aaaa"),
-			observationsRecordedEntry("om-aaaaaaaaaaaa", { observations: [obs1], coversUpToId: "raw-1" }),
-			reflectionsRecordedEntry("om-eeeeeeeeeeee", { reflections: [ref1], coversUpToId: "raw-1" }),
-		];
-		const { run } = setup({ entries, observationsPoolMaxTokens: 100 });
-
-		const result = await run("raw-1") as any;
-
-		expect(result.compaction.details.fullFold).toBe(false);
-		expect(result.compaction.details.observations.map((obs: any) => obs.id)).toEqual(["aaaaaaaaaaaa"]);
-		expect(result.compaction.details.reflections).toEqual([]);
-		expect(result.compaction.summary).toContain("## Observations");
-		expect(result.compaction.summary).not.toContain("## Reflections");
+	it("refuses a boundary that would resurrect already compacted uncovered source", () => {
+		const entries = [textCustomMessage("raw-1", "a"), recorded(), textCustomMessage("raw-2", "b"), textCustomMessage("raw-3", "c"), compactionEntry("cmp", { firstKeptEntryId: "raw-3", details: memoryDetails() })];
+		expect(safeCompactionCut(entries, "raw-3")).toMatchObject({ ok: false, reason: "incompatible_previous_boundary" });
 	});
-
-	it("writes a normal V3 projection without applying new reflections or drops", async () => {
-		const obs1 = observation("aaaaaaaaaaaa", { tokenCount: 5 });
-		const obs2 = observation("bbbbbbbbbbbb", { tokenCount: 5 });
-		const ref1 = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"]);
-		const ref2 = reflection("ffffffffffff", ["bbbbbbbbbbbb"]);
-		const entries = [
-			textCustomMessage("raw-1", "aaaa"),
-			observationsRecordedEntry("om-aaaaaaaaaaaa", { observations: [obs1], coversUpToId: "raw-1" }),
-			reflectionsRecordedEntry("om-eeeeeeeeeeee", { reflections: [ref1], coversUpToId: "raw-1" }),
-			compactionEntry("cmp-full", { firstKeptEntryId: "raw-1", details: memoryDetails({ fullFold: true, observations: [obs1], reflections: [ref1] }) }),
-			textCustomMessage("raw-2", "bbbb"),
-			observationsRecordedEntry("om-bbbbbbbbbbbb", { observations: [obs2], coversUpToId: "raw-2" }),
-			reflectionsRecordedEntry("om-ffffffffffff", { reflections: [ref2], coversUpToId: "raw-2" }),
-			observationsDroppedEntry("om-drop-2", { observationIds: ["aaaaaaaaaaaa"], coversUpToId: "raw-2" }),
-		];
-		const { run } = setup({ entries, observationsPoolMaxTokens: 100 });
-
-		const result = await run("raw-2") as any;
-
-		expect(result.compaction.details).toMatchObject({ type: "om.folded", version: 1, fullFold: false });
-		expect(result.compaction.details.observations.map((obs: any) => obs.id)).toEqual(["aaaaaaaaaaaa", "bbbbbbbbbbbb"]);
-		expect(result.compaction.details.reflections.map((ref: any) => ref.id)).toEqual(["eeeeeeeeeeee"]);
-		expect(result.compaction.summary).toContain("## Reflections\n[eeeeeeeeeeee]");
-		expect(result.compaction.summary).toContain("## Observations");
+	it("persists completion only after Pi commits, with no memory in event payload", async () => {
+		const s = setup([textCustomMessage("raw-1", "a"), recorded(), textCustomMessage("raw-2", "b")]);
+		await s.run("raw-2");
+		expect(s.pi.appendEntry.mock.calls.some(([, data]) => data.type === "memory.compaction.completed")).toBe(false);
+		s.handlers.session_compact({ compactionEntry: { id: "cmp", firstKeptEntryId: "raw-2" } }, s.ctx);
+		const completed = s.pi.appendEntry.mock.calls.find(([, data]) => data.type === "memory.compaction.completed")![1];
+		expect(completed).toMatchObject({ version: 1, timestamp: expect.any(String), metadata: { firstKeptEntryId: "raw-2", observedThrough: "raw-1", durationMs: expect.any(Number) } });
+		expect(JSON.stringify(completed)).not.toContain("Observation aaaaaaaaaaaa");
+		expect(s.pi.appendEntry).toHaveBeenCalledWith(MEMORY_STATE, expect.objectContaining({ observations: [observation("aaaaaaaaaaaa")], observedThrough: "raw-1", observer: "idle" }));
+		expect(s.pi.events.emit).toHaveBeenCalledWith(MEMORY_EVENT, completed);
 	});
-
-	it("writes a full V3 projection when observation pool pressure reaches the threshold", async () => {
-		const obs1 = observation("aaaaaaaaaaaa", { tokenCount: 80 });
-		const obs2 = observation("bbbbbbbbbbbb", { tokenCount: 30 });
-		const ref1 = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"]);
-		const ref2 = reflection("ffffffffffff", ["bbbbbbbbbbbb"]);
-		const entries = [
-			textCustomMessage("raw-1", "aaaa"),
-			observationsRecordedEntry("om-aaaaaaaaaaaa", { observations: [obs1], coversUpToId: "raw-1" }),
-			reflectionsRecordedEntry("om-eeeeeeeeeeee", { reflections: [ref1], coversUpToId: "raw-1" }),
-			compactionEntry("cmp-full", { firstKeptEntryId: "raw-1", details: memoryDetails({ fullFold: true, observations: [obs1], reflections: [ref1] }) }),
-			textCustomMessage("raw-2", "bbbb"),
-			observationsRecordedEntry("om-bbbbbbbbbbbb", { observations: [obs2], coversUpToId: "raw-2" }),
-			reflectionsRecordedEntry("om-ffffffffffff", { reflections: [ref2], coversUpToId: "raw-2" }),
-			observationsDroppedEntry("om-drop-2", { observationIds: ["aaaaaaaaaaaa"], coversUpToId: "raw-2" }),
-		];
-		const { run } = setup({ entries, observationsPoolMaxTokens: 100 });
-
-		const result = await run("raw-2") as any;
-
-		expect(result.compaction.details.fullFold).toBe(true);
-		expect(result.compaction.details.observations.map((obs: any) => obs.id)).toEqual(["bbbbbbbbbbbb"]);
-		expect(result.compaction.details.reflections.map((ref: any) => ref.id)).toEqual(["eeeeeeeeeeee", "ffffffffffff"]);
+	it("persists explicit compaction failure rather than completion", async () => {
+		const s = setup([textCustomMessage("raw-1", "a"), recorded(), textCustomMessage("raw-2", "b")]);
+		await s.run("raw-2");
+		s.handlers.session_compact_failed({ errorMessage: "disk error", aborted: false }, s.ctx);
+		expect(s.pi.appendEntry).toHaveBeenCalledWith(MEMORY_EVENT, expect.objectContaining({ type: "memory.compaction.failed", metadata: expect.objectContaining({ failure: "disk error" }) }));
 	});
-
-	it("delegates to native compaction when only old V2 memory exists", async () => {
-		const entries = [
-			textCustomMessage("raw-1", "aaaa"),
-			oldV2ObservationEntry("v2-obs"),
-			compactionEntry("cmp-v2", { firstKeptEntryId: "raw-1", details: oldV2CompactionDetails() }),
-		];
-		const { run } = setup({ entries });
-
-		const result = await run("cmp-v2");
-
-		expect(result).toBeUndefined();
+	it("fails closed on persistence errors and cancels duplicate hooks", async () => {
+		const s = setup([textCustomMessage("raw-1", "a"), recorded(), textCustomMessage("raw-2", "b")]);
+		s.pi.appendEntry.mockImplementation(() => { throw Error("disk error"); });
+		await expect(s.run("raw-2")).resolves.toEqual({ cancel: true });
+		s.runtime.compactHookInFlight = true;
+		await expect(s.run("raw-2")).resolves.toEqual({ cancel: true });
 	});
+});
 
-	it("does not wait for worker promises or call model resolution", async () => {
-		const entries = [textCustomMessage("raw-1", "aaaa")];
-		const { run, runtime } = setup({ entries });
-
-		const result = await Promise.race([
-			run("raw-1"),
-			new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), 50)),
-		]);
-
-		expect(result).toBeUndefined();
-		expect(runtime.resolveModel).not.toHaveBeenCalled();
+describe("observer coverage identity", () => {
+	it.each([
+		{ coversUpToId: "missing" },
+		{ observations: [] },
+		{ observations: [{ content: "invalid" }] },
+		{ coverage: null },
+		{ coverage: "invalid" },
+		{ coverage: { version: 1, fromExclusiveId: "wrong", sourceEntryIds: ["raw-1"], truncatedSourceEntryIds: [] } },
+		{ coverage: { version: 1, fromExclusiveId: null, sourceEntryIds: ["foreign"], truncatedSourceEntryIds: [] } },
+		{ coverage: { version: 1, fromExclusiveId: null, sourceEntryIds: ["raw-1"], truncatedSourceEntryIds: ["raw-1"] } },
+		{ observations: [observation("aaaaaaaaaaaa", { sourceEntryIds: ["foreign"] })] },
+	])("ignores invalid coverage %j", (overrides) => {
+		expect(committedObserverFrontier([textCustomMessage("raw-1", "a"), recorded("raw-1", ["raw-1"], overrides)]).id).toBeNull();
 	});
-
-	it("cancels duplicate in-flight compaction and notifies the UI", async () => {
-		const entries = [textCustomMessage("raw-1", "aaaa")];
-		const { run, ctx } = setup({ entries, compactHookInFlight: true });
-
-		await expect(run("raw-1")).resolves.toEqual({ cancel: true });
-		expect(ctx.ui.notify).toHaveBeenCalledWith(
-			"Observational memory: another compaction is already in progress; cancelling duplicate",
-			"warning",
-		);
+	it("rejects future markers and ambiguous duplicate entry IDs", () => {
+		expect(committedObserverFrontier([recorded(), textCustomMessage("raw-1", "a")]).id).toBeNull();
+		expect(committedObserverFrontier([textCustomMessage("raw-1", "a"), recorded(), textCustomMessage("raw-1", "b")]).id).toBeNull();
+	});
+	it("advances only a contiguous chain and keeps prior good coverage on bad later commits", () => {
+		const first = recorded();
+		const second = recorded("raw-2", ["raw-2"], { coverage: { version: 1, fromExclusiveId: "raw-1", sourceEntryIds: ["raw-2"], truncatedSourceEntryIds: [] } });
+		second.id = "second";
+		const entries = [textCustomMessage("raw-1", "a"), first, textCustomMessage("raw-2", "b"), second];
+		expect(committedObserverFrontier(entries).id).toBe("raw-2");
+		(second.data as any).coverage.fromExclusiveId = null;
+		expect(committedObserverFrontier(entries).id).toBe("raw-1");
 	});
 });

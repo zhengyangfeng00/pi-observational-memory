@@ -72,7 +72,7 @@ Dropping does not delete history. Dropped observations remain recallable from le
 
 The observer runs asynchronously from `turn_end` when raw/source tokens after the latest observation coverage marker reach `observeAfterTokens`. After a deliberate empty result, it waits for another `observeAfterTokens` of source tokens before retrying the uncovered range.
 
-It receives an oldest-first chunk of raw/source entries, validates source ids, and appends a non-empty `om.observations.recorded` entry. Chunking targets a fixed 60,000 estimated tokens but always includes at least one entry, so a single oversized entry cannot stall coverage. If there is nothing worth recording, it writes no entry and leaves the raw range uncovered.
+It receives an oldest-first chunk of raw/source entries, validates source ids, and appends a non-empty `om.observations.recorded` entry. Chunking uses a configured or model-derived source budget. Coverage requires complete source input; a single entry that only fits as an excerpt blocks observation until the budget is raised. If there is nothing worth recording, it writes no entry and leaves the raw range uncovered.
 
 ### Reflector
 
@@ -95,7 +95,7 @@ The compaction hook runs during `session_before_compact`. When V3 memory exists,
 - it does not wait for background memory workers;
 - it folds/projects ledger state and renders the summary.
 
-If the projection is empty, the hook returns no extension compaction and Pi uses its native summarizer. This preserves pre-cut context instead of persisting an empty summary. Prepared V3 compactions remain effectively instantaneous compared with V2.
+The kept boundary is clamped to the committed observer frontier at a valid Pi cut point. If the projection is empty or no safe progress boundary exists, the hook cancels compaction and retains raw history. It never treats a running worker's target as coverage. See [telemetry.md](telemetry.md) for the coverage identity and persisted integration contract.
 
 ## Ledger entries
 

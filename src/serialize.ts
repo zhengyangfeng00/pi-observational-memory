@@ -192,8 +192,8 @@ function isSourceRenderableEntry(entry: RenderableEntry): boolean {
 
 /**
  * Serialize complete source entries up to the token budget. If the first entry
- * alone exceeds the budget, include a clearly marked head/tail excerpt so one
- * pathological tool result cannot permanently block observation coverage.
+ * alone exceeds the budget, report a clearly marked head/tail excerpt. Callers
+ * decide whether excerpts can grant coverage; the observer requires full input.
  * The original ledger entry is never modified and remains recallable by id.
  */
 export function serializeSourceAddressedBranchEntries(
@@ -207,8 +207,8 @@ export function serializeSourceAddressedBranchEntries(
 
 	for (const entry of entries) {
 		if (!entry.id || !isSourceRenderableEntry(entry)) continue;
-		const rendered = serializeBranchEntries([entry]);
-		if (!rendered.trim()) continue;
+		const rawRendered = serializeBranchEntries([entry]);
+		const rendered = rawRendered.trim() ? rawRendered : "[Source entry has no serializable text]";
 		const label = `[Source entry id: ${entry.id}]`;
 		const block = `${label}\n${rendered}`;
 		const separator = blocks.length > 0 ? "\n\n" : "";

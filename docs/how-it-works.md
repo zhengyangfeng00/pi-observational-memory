@@ -2,7 +2,7 @@
 
 This is the V3 technical reference for `pi-observational-memory`.
 
-V3 is ledger-centered: memory state is reconstructed by folding V3 ledger entries on the current branch. When that projection is non-empty, V3 renders it model-free into the summary the agent sees. Empty projections delegate to Pi's native summarizer.
+V3 is ledger-centered: memory state is reconstructed by folding V3 ledger entries on the current branch. V3 renders committed memory model-free into the summary the agent sees. Compaction retains every source beyond the committed observer frontier; an empty projection or unsafe boundary cancels rather than delegating to Pi's native summarizer.
 
 ## Runtime entry points
 
@@ -174,7 +174,7 @@ The observer trigger runs on `turn_end`.
 12. Compute deterministic 12-character ids and per-observation token counts in code.
 13. Append `om.observations.recorded` only if at least one observation was accepted.
 
-If no observations are generated, the worker writes no entry and does not advance coverage. A later eligible observer run will see a larger range. Deliberate empty runs back off until another `observeAfterTokens` worth of new source tokens arrives, so they do not re-fire every turn. Observer chunks target a fixed 60,000 estimated tokens, oldest-first, so an oversized uncovered span drains in slices; the oldest entry is always included even if it alone exceeds the target, preventing coverage from stalling. API/stream failures surface as `observer failed` / `observer.stream_error` rather than as an empty run.
+If no observations are generated, the worker writes no entry and does not advance coverage. A later eligible observer run will see a larger range. Deliberate empty runs back off until another `observeAfterTokens` worth of new source tokens arrives, so they do not re-fire every turn. Observer chunks use the configured/model-derived token budget, oldest-first, so a large backlog drains in complete-entry slices. An individual source that only fits as an excerpt fails with `incomplete_source` and retains coverage; raise the budget to observe it in full. API/stream failures surface as `observer failed` / `observer.stream_error` rather than as an empty run.
 
 ## Reflect/drop flow
 
@@ -222,11 +222,12 @@ It does only deterministic work:
 
 1. Guard against duplicate concurrent compaction hooks.
 2. Load config if needed.
-3. Read `event.preparation.firstKeptEntryId` and `event.preparation.tokensBefore`.
-4. Build a compaction projection from branch entries and `firstKeptEntryId`.
-5. Render a summary from projected reflections and observations.
-6. If the summary is empty, return no extension result so Pi uses native compaction.
-7. Otherwise return `{ compaction: { summary, firstKeptEntryId, tokensBefore, details } }` where `details.type` is `om.folded`.
+3. Read Pi's desired `event.preparation.firstKeptEntryId` and `tokensBefore`.
+4. Resolve validated committed observer coverage on this branch and clamp the desired cutoff backwards to a valid Pi cut point that retains all uncovered source (and associated tool calls).
+5. Cancel if there is no removable covered source or no safe representable boundary.
+6. Build a projection through the committed frontier, including any observer batch that spans Pi's earlier desired cutoff, and render memory deterministically.
+7. Cancel if the rendered memory is empty; otherwise return `{ compaction: { summary, firstKeptEntryId, tokensBefore, details } }` with the safe boundary and `details.type` equal to `om.folded`.
+8. Persist requested/blocked/deferred telemetry. Persist completion only after Pi emits `session_compact`, and failures through `session_compact_failed`. Separate state snapshots expose current derived memory. See [telemetry.md](telemetry.md).
 
 It does not:
 
@@ -234,9 +235,9 @@ It does not:
 - run a sync observer;
 - run reflector/dropper;
 - wait for worker promises;
-- append ledger entries.
+- append worker ledger entries (only telemetry entries).
 
-If another compaction hook is already in flight, it returns `{ cancel: true }`. Delegating an empty projection is intentionally different: Pi proceeds with its native summarizer so pre-cut context is preserved.
+If another compaction hook is already in flight, it returns `{ cancel: true }`. Empty memory also cancels: retaining unobserved raw history takes priority over context relief.
 
 ## Projections
 
@@ -331,7 +332,9 @@ Recall ignores old V2 memory by construction because it indexes only V3 ledger e
 - Invalid source/support/drop ids are filtered or rejected by code.
 - Background worker errors are recorded on runtime state and surfaced in `/om:status`.
 - Compaction does not wait for background workers; it folds whatever ledger state is already present.
-- Historical or invalid coverage markers are tolerated by progress helpers instead of throwing.
+- Observer progress and compaction share validated committed coverage, rejecting malformed/future/foreign markers and incomplete coverage identities.
+- Async worker commits require the original session and captured branch prefix; append-only growth is permitted, while navigation, replacement and relevant context edits invalidate the result.
+- Full memory lives in separate branch-local `observational-memory:state` snapshots, not in each `observational-memory:event` lifecycle row.
 
 ## V2 behavior
 
@@ -341,7 +344,8 @@ V3 does not use V2 state shapes. Old V2 custom memory entries, old V2 compaction
 
 - The branch-local V3 ledger is the memory source of truth.
 - Pi compaction summaries represent what the agent sees.
-- Non-empty V3 compaction projections are deterministic and model-free; empty projections delegate to Pi's native summarizer.
+- No source is removed from model context by this extension's compaction until committed observer coverage reaches it.
+- V3 compaction projections are deterministic and model-free; empty projections or unsafe cutoffs cancel and retain raw context.
 - Observer input is raw/source entries only.
 - `coversUpToId` is a progress/projection watermark, not provenance.
 - Kept observations and reflections are rendered without paraphrase.
