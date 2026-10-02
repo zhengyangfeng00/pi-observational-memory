@@ -11,9 +11,9 @@ Both runs used the installed Pi 1.0.0 composed model runtime with `openai-codex/
 | [Captured tool result](replays/captured-tool-result.json) | Original tool call/result IDs | 2 | One observation cites `3c6044e4`; isolated replay frontier reaches `3c6044e4`. |
 | [User envelope](replays/captured-image-user-envelope.json) | Actual captured image/text rewrapped as user source `user-replay-3c6044e4` | 2 | One observation cites that user source; isolated frontier advances. This is not a historical user entry in the captured ledger. |
 
-Each run allowed at most two worker turns, three provider requests, 2048 response tokens per request, and a 90-second provider timeout. The composed provider's `onPayload` hook found the original MIME type and exact decoded-image SHA-256 in both actual outgoing requests. Successful attributed observations and committed coverage demonstrate provider acceptance; this is not merely an assertion about the serializer. The artifacts contain hashes and aggregate results, never image data, credentials, or observation prose.
+Each run allowed at most two worker turns, three provider requests, 2048 response tokens per request, and a 90-second provider timeout. The composed provider's `onPayload` hook captured each request separately. Every captured payload must contain the exact ordered list of original MIME types and decoded-image SHA-256 hashes, including repeated occurrences; missing capture, later image loss, reordering, extra images, or duplicate loss fails verification. Both reruns preserved the complete image list in each of their two outgoing requests. Successful attributed observations and committed coverage demonstrate provider acceptance; this is not merely an assertion about the serializer. The artifacts contain per-request image hashes and aggregate results, never image data, credentials, or observation prose.
 
-These are deliberately isolated source-span replays, not claims that the entire captured session was observed or compacted. Deterministic tests cover contiguous prefix construction, user/tool/custom input, rejected payloads, budgets, incompatible fallbacks, native-compaction resume/fork behavior, and unchanged textual reflector/dropper input.
+These are deliberately isolated source-span replays, not claims that the entire captured session was observed or compacted. Deterministic tests cover contiguous prefix construction, user/tool/custom input, rejected payloads, budgets including normalized tool schemas on real agent-loop continuations, incompatible fallbacks, native-compaction resume/fork behavior, unchanged textual reflector/dropper input, and strict per-request image verification.
 
 ## Reproduce
 
@@ -24,7 +24,7 @@ node --import tsx scripts/replay-observer.mjs <session.jsonl> <image-entry-id> o
 node --import tsx scripts/replay-observer.mjs <session.jsonl> <image-entry-id> openai-codex gpt-6.1-sol --as-user
 ```
 
-When the development SDK lacks the target catalog entry, set `PI_OBSERVER_REPLAY_SDK` to the installed Pi coding-agent `dist/index.js` module before running either command. Missing models/auth, worker failures, unmatched outgoing image hashes, missing attribution, or an unchanged replay frontier fail the check. Authentication must already be available; do not start interactive login from this script.
+When the development SDK lacks the target catalog entry, set `PI_OBSERVER_REPLAY_SDK` to the installed Pi coding-agent `dist/index.js` module before running either command. Missing models/auth, worker failures, incomplete or mismatched ordered image lists in any request payload, missing attribution, or an unchanged replay frontier fail the check. Authentication must already be available; do not start interactive login from this script.
 
 The local image allowance is a conservative estimate, not exact provider accounting. The replay does not establish compatibility with every provider, animated-image interpretation, or arbitrary summary-only session imports.
 

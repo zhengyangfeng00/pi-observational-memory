@@ -1,12 +1,45 @@
 {
-  "model": { "provider": "openai-codex", "id": "gpt-6.1-sol", "contextWindow": 272000 },
+  "model": {
+    "provider": "openai-codex",
+    "id": "gpt-6.1-sol",
+    "contextWindow": 272000
+  },
   "scope": "isolated captured source span, original session unchanged",
-  "sourceEntryIds": ["d7d8cf0f", "3c6044e4"],
+  "capturedImageEntryId": "3c6044e4",
+  "sourceEntryIds": [
+    "d7d8cf0f",
+    "3c6044e4"
+  ],
   "chunkTokens": 51592,
-  "originalImages": [{ "mimeType": "image/png", "sha256": "dd8b984977e3b3cfe89363960b189b280e1c7c2c0e6094904996220e68aaead2" }],
-  "wireImages": [
-    { "mimeType": "image/png", "sha256": "dd8b984977e3b3cfe89363960b189b280e1c7c2c0e6094904996220e68aaead2" },
-    { "mimeType": "image/png", "sha256": "dd8b984977e3b3cfe89363960b189b280e1c7c2c0e6094904996220e68aaead2" }
+  "originalImages": [
+    {
+      "mimeType": "image/png",
+      "sha256": "dd8b984977e3b3cfe89363960b189b280e1c7c2c0e6094904996220e68aaead2"
+    }
+  ],
+  "wireRequests": [
+    {
+      "request": 1,
+      "payloadImages": [
+        [
+          {
+            "mimeType": "image/png",
+            "sha256": "dd8b984977e3b3cfe89363960b189b280e1c7c2c0e6094904996220e68aaead2"
+          }
+        ]
+      ]
+    },
+    {
+      "request": 2,
+      "payloadImages": [
+        [
+          {
+            "mimeType": "image/png",
+            "sha256": "dd8b984977e3b3cfe89363960b189b280e1c7c2c0e6094904996220e68aaead2"
+          }
+        ]
+      ]
+    }
   ],
   "delivered": true,
   "requests": 2,

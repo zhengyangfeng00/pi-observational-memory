@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { runAgentLoop } from "@earendil-works/pi-agent-core";
+import { createAssistantMessageEventStream, Type } from "@earendil-works/pi-ai";
 import { runObserver, ObserverStreamError } from "../src/agents/observer/agent.js";
 import { estimateImageTokens, IMAGE_TOKEN_RESERVE, validateObserverRequest } from "../src/image-budget.js";
 import { serializeSourceAddressedBranchEntries } from "../src/serialize.js";
@@ -110,6 +112,63 @@ describe("multimodal observer", () => {
 			expect(() => stream(model, { systemPrompt: "s".repeat(50_000), messages: [{ role: "user", content: source, timestamp: 0 }], tools: [{ name: "huge", parameters: { payload: "t".repeat(40_000) } }] }, { maxTokens: 8_192 })).toThrow("image_budget");
 			expect(provider).not.toHaveBeenCalled();
 		}) });
+	});
+
+	it("budgets normalized tool declarations on real agent-loop continuations", async () => {
+		const selected = { ...model, provider: "test", api: "test", id: "vision", contextWindow: 62_000 };
+		const schema = Type.Object({ value: Type.String({ description: "s".repeat(32_000) }) });
+		const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "done" }], details: undefined }));
+		const tool = { name: "schema_tool", label: "Schema tool", description: "exercise schema budgeting", parameters: schema, execute };
+		const prompts = [{ role: "user" as const, content: [image], timestamp: 0 }];
+		const context = { messages: [{ role: "system" as const, content: "system", sections: { rules: "metadata instructions" }, timestamp: 0 }], tools: [tool] };
+		const config = { model: selected, maxTokens: 8_192, convertToLlm: (messages: any[]) => messages, toolExecution: "sequential" as const };
+		// The initial raw preflight still supports the legacy Context.tools field.
+		expect(() => validateObserverRequest(selected, { messages: [...context.messages, ...prompts], tools: [tool] }, config.maxTokens)).not.toThrow();
+		const requests: any[] = [];
+		const provider = vi.fn(() => {
+			const firstRequest = provider.mock.calls.length === 1;
+			const message = {
+				role: "assistant" as const, api: "test", provider: "test", model: "vision", timestamp: 0,
+				content: firstRequest
+					? [{ type: "text", text: "x".repeat(3_000) }, { type: "toolCall", id: "call", name: "schema_tool", arguments: { value: "ok" } }]
+					: [{ type: "text", text: "done" }],
+				stopReason: firstRequest ? "toolUse" : "stop",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			};
+			const stream = createAssistantMessageEventStream();
+			stream.push({ type: "start", partial: message } as any);
+			stream.push({ type: "done", reason: message.stopReason, message } as any);
+			return stream;
+		});
+		await expect(runAgentLoop(prompts, context, config as any, async () => {}, undefined, (nextModel, nextContext, options) => {
+			requests.push(nextContext);
+			validateObserverRequest(nextModel, nextContext, options?.maxTokens ?? config.maxTokens);
+			return provider();
+		})).rejects.toThrow("image_budget");
+		expect(execute).toHaveBeenCalledOnce();
+		expect(provider).toHaveBeenCalledOnce(); // First request fit; continuation was blocked before dispatch.
+		expect(requests).toHaveLength(2);
+		for (const request of requests) {
+			expect(request.tools).toBeUndefined();
+			expect(request.messages.flatMap((message: any) => message.toolsAdded ?? [])[0].parameters).toEqual(schema);
+		}
+		// Without normalized schemas the very same continuation would fit.
+		const withoutSchemas = { messages: requests[1].messages.map((message: any) => {
+			const { toolsAdded: _toolsAdded, ...rest } = message;
+			return rest;
+		}) };
+		expect(() => validateObserverRequest(selected, withoutSchemas, config.maxTokens)).not.toThrow();
+	});
+
+	it("counts complete normalized system metadata, not only toolsAdded", () => {
+		const context = { messages: [
+			{ role: "system", content: "", sections: { instructions: "漢".repeat(30_000) }, toolsAdded: [], toolsRemoved: [{ name: "removed" }], timestamp: 0 },
+			{ role: "user", content: [image], timestamp: 0 },
+		] } as any;
+		expect(() => validateObserverRequest(model, context, 8_192)).toThrow("image_budget");
+		context.messages[0].sections = {};
+		context.messages[0].futureMetadata = { declaration: "x".repeat(100_000) };
+		expect(() => validateObserverRequest(model, context, 8_192)).toThrow("image_budget");
 	});
 
 	it.each([

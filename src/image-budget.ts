@@ -58,6 +58,13 @@ export function validateObserverRequest(model: Model<any>, context: Context, out
 	let imageCount = 0;
 	let inputTokens = OBSERVER_REQUEST_MARGIN;
 	for (const message of context.messages) {
+		if (message.role === "system") {
+			// agentLoop normalizes away Context.tools/systemPrompt. Sections,
+			// tool declarations and deltas live on system messages instead.
+			// Count all metadata, not a field allowlist that can omit schemas.
+			const { content: _content, ...metadata } = message;
+			inputTokens += Buffer.byteLength(JSON.stringify(metadata), "utf8");
+		}
 		if (typeof message.content === "string") inputTokens += Buffer.byteLength(message.content, "utf8");
 		else for (const block of message.content) {
 			if (block.type === "image") {
@@ -74,6 +81,7 @@ export function validateObserverRequest(model: Model<any>, context: Context, out
 	if (!imageCount) return; // Existing text-only worker behavior is unchanged.
 	if (!model.input?.includes("image")) throw new Error("unsupported_model: observer model does not accept images");
 	if (!Number.isFinite(model.contextWindow) || model.contextWindow <= 0) throw new Error("image_budget: observer model has no known context window");
+	// Keep support for the unnormalized initial preflight/legacy shorthands.
 	inputTokens += Buffer.byteLength(context.systemPrompt ?? "", "utf8");
 	inputTokens += Buffer.byteLength(JSON.stringify(context.tools ?? []), "utf8");
 	if (inputTokens + outputTokens > model.contextWindow) throw new Error("image_budget: complete observer request exceeds context allowance");
