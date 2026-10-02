@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { convertToLlm } from "@earendil-works/pi-coding-agent";
 
 import { renderRecallSourceEntry, serializeSourceAddressedBranchEntries } from "../src/serialize.js";
 import { estimateStringTokens } from "../src/tokens.js";
@@ -29,6 +30,56 @@ function toolResultEntry(id: string, text: string) {
 }
 
 describe("source-addressed serialization budget", () => {
+	it("includes an explicit label for empty source rather than creating a coverage identity gap", () => {
+		const result = serializeSourceAddressedBranchEntries([
+			{ type: "message", id: "empty", message: { role: "assistant", content: [] } },
+			customEntry("next", "text"),
+		]);
+		expect(result.sourceEntryIds).toEqual(["empty", "next"]);
+		expect(result.text).toContain("[Source entry id: empty]");
+		expect(result.incompleteSourceEntryIds).toEqual([]);
+		expect(result.truncatedSourceEntryIds).toEqual([]);
+	});
+	it.each([
+		[{ role: "user", content: "USER_PAYLOAD" }, "USER_PAYLOAD"],
+		[{ role: "assistant", content: [{ type: "thinking", thinking: "THINKING_PAYLOAD" }, { type: "toolCall", name: "bash", arguments: { command: "CALL_PAYLOAD" } }] }, "CALL_PAYLOAD"],
+		[{ role: "toolResult", toolName: "bash", content: [{ type: "text", text: "RESULT_PAYLOAD" }] }, "RESULT_PAYLOAD"],
+		[{ role: "system", content: "SYSTEM_PAYLOAD", sections: { guidelines: "SECTION_PAYLOAD" }, toolsAdded: [{ name: "TOOL_PAYLOAD" }] }, "SECTION_PAYLOAD"],
+		[{ role: "custom", customType: "note", content: "CUSTOM_PAYLOAD" }, "CUSTOM_PAYLOAD"],
+		[{ role: "branchSummary", summary: "BRANCH_PAYLOAD" }, "BRANCH_PAYLOAD"],
+		[{ role: "compactionSummary", summary: "COMPACTION_PAYLOAD" }, "COMPACTION_PAYLOAD"],
+	])("preserves supported message payload %j", (message, payload) => {
+		const result = serializeSourceAddressedBranchEntries([{ type: "message", id: "source", message }]);
+		expect(result.text).toContain(payload as string);
+		expect(result.sourceEntryIds).toEqual(["source"]);
+		expect(result.incompleteSourceEntryIds).toEqual([]);
+	});
+
+	it("matches Pi's bash context including command/output and annotations in input and recall", () => {
+		const message = { role: "bashExecution" as const, command: "DISTINCT_COMMAND", output: "DISTINCT_OUTPUT", exitCode: 9, cancelled: false, truncated: true, fullOutputPath: "/tmp/distinct-output", timestamp: Date.now() };
+		const entry = { type: "message", id: "bash", message };
+		const projected = (convertToLlm([message])[0].content as any[])[0].text;
+		expect(serializeSourceAddressedBranchEntries([entry]).text).toContain(projected);
+		expect(renderRecallSourceEntry(entry)).toContain(projected);
+		const excluded = serializeSourceAddressedBranchEntries([{ ...entry, message: { ...message, excludeFromContext: true } }]);
+		expect(excluded.text).toContain("Excluded from model context");
+		expect(excluded.text).not.toContain(message.command);
+	});
+
+	it.each([
+		{ type: "message", id: "unsupported", message: { role: "unknown", payload: "hidden" } },
+		{ type: "message", id: "unsupported", message: { role: "user", content: [{ type: "image", data: "binary" }] } },
+		{ type: "custom_message", id: "unsupported", content: [{ type: "unknown", payload: "hidden" }] },
+		{ type: "branch_summary", id: "unsupported", summary: undefined },
+	])("marks unsupported source incomplete and never skips to later source %j", (entry) => {
+		const blocked = serializeSourceAddressedBranchEntries([entry, customEntry("later", "later")]);
+		expect(blocked.incompleteSourceEntryIds).toEqual(["unsupported"]);
+		expect(blocked.sourceEntryIds).toEqual([]);
+		const prefix = serializeSourceAddressedBranchEntries([customEntry("before", "before"), entry, customEntry("later", "later")]);
+		expect(prefix.sourceEntryIds).toEqual(["before"]);
+		expect(prefix.incompleteSourceEntryIds).toEqual([]);
+	});
+
 	it("preserves all source blocks when they fit", () => {
 		const entries = [
 			customEntry("raw-1", "first"),
@@ -69,6 +120,7 @@ describe("source-addressed serialization budget", () => {
 			sourceEntryIds: [],
 			estimatedTokens: 0,
 			truncatedSourceEntryIds: [],
+			incompleteSourceEntryIds: [],
 		});
 	});
 

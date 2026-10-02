@@ -95,7 +95,7 @@ Lower values create smaller chunks and more frequent model calls. Higher values 
 
 Default: derived as 20% of the resolved memory model's context window, or `60000` when that window is unavailable.
 
-This caps the source-addressed text sent to one observer run. Complete source entries are added oldest-first while they fit; remaining entries stay eligible for later runs. If the oldest entry alone exceeds the budget, the observer receives a clearly marked head/tail excerpt instead of an over-context request. The original session entry is not modified, and observations still cite its original source id so the source remains traceable in the session ledger.
+This caps the source-addressed text sent to one observer run. Complete source entries are added oldest-first while they fit; remaining entries stay eligible for later runs. If the oldest entry alone exceeds the budget, the serializer identifies an excerpt-only input and the observer stage fails explicitly with `incomplete_source`. It does not advance coverage or authorize compaction of that source. Raise the budget (and, if needed, select a larger-context memory model) to observe the full entry. The original session entry is not modified.
 
 Set an explicit value when a provider exposes a context window that differs from Pi's model metadata. Values below `256` are clamped to `256` so a chunk can always carry a complete source label, omission marker, and useful context. Keep room for the observer system prompt, prior observations/reflections, tool schemas, and output; setting this equal to the full model window will usually fail.
 
@@ -115,7 +115,7 @@ Default: `81000`.
 
 The auto-compaction trigger runs from Pi's `agent_settled` hook, after retries, automatic compaction, and queued continuation finish. It counts estimated source-entry tokens after the latest compaction boundary. The count starts at `firstKeptEntryId` when Pi provides that boundary, so retained source entries remain part of the metric. Memory ledger entries and compaction metadata contribute zero. If the count reaches `compactAfterTokens`, the extension defers with `setTimeout(0)`, checks that Pi is idle, re-checks the same metric, and calls `ctx.compact()`. Pi's provider context usage is not used for this threshold.
 
-This trigger does not wait for observer, reflector, or dropper work. Actual compaction summary creation happens later in `session_before_compact`. A non-empty V3 projection is rendered deterministically and model-free; an empty projection delegates to Pi's native summarizer so prior context is not replaced by an empty summary.
+This trigger does not wait for observer, reflector, or dropper work. Actual compaction summary creation happens later in `session_before_compact`. A non-empty V3 projection is rendered deterministically and model-free. The hook clamps the kept boundary to committed observer coverage and cancels if no safe progress boundary or rendered memory exists. Unobserved source remains raw rather than being delegated to Pi's native summarizer. Lifecycle events and separate current-memory snapshots are persisted as described in [telemetry.md](telemetry.md).
 
 Pi's own window-pressure compaction and manual compaction can still happen independently of this proactive trigger.
 
@@ -223,7 +223,7 @@ When `false`, the extension hides routine observer, reflector, and dropper progr
 
 Default: `false`.
 
-When `true`, the extension does not proactively run the observer, reflector/dropper lane, or auto-compaction trigger. Manual/Pi compaction hooks, `/om:status`, `/om:view`, and `recall` remain available.
+When `true`, the extension does not proactively run the observer, reflector/dropper lane, or auto-compaction trigger. Manual/Pi compaction hooks, `/om:status`, `/om:view`, and `recall` remain available. The coverage safety guard still applies in passive mode, so a session without committed observer coverage cannot compact while the extension is loaded.
 
 Environment override:
 

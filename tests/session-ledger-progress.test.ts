@@ -90,7 +90,7 @@ describe("session-ledger V3 progress helpers", () => {
 		const entries = [
 			textCustomMessage("raw-1", "aaaa"),
 			textCustomMessage("raw-2", "bbbbbbbb"),
-			observationsRecordedEntry("om-aaaaaaaaaaaa", { observations: [observation("aaaaaaaaaaaa")], coversUpToId: "raw-2" }),
+			observationsRecordedEntry("om-aaaaaaaaaaaa", { observations: [observation("aaaaaaaaaaaa")], coversUpToId: "raw-2", coverage: { version: 1, fromExclusiveId: null, sourceEntryIds: ["raw-1", "raw-2"], truncatedSourceEntryIds: [] } }),
 			observationsRecordedEntry("om-bbbbbbbbbbbb", { observations: [observation("bbbbbbbbbbbb")], coversUpToId: "raw-1" }),
 			textCustomMessage("raw-3", "cccccccccccc"),
 		];
@@ -105,7 +105,7 @@ describe("session-ledger V3 progress helpers", () => {
 			textCustomMessage("raw-1", "aaaa"),
 			textCustomMessage("raw-2", "bbbbbbbb"),
 			textCustomMessage("raw-3", "cccccccccccc"),
-			observationsRecordedEntry("om-obs", { observations: [observation("aaaaaaaaaaaa")], coversUpToId: "raw-3" }),
+			observationsRecordedEntry("om-obs", { observations: [observation("aaaaaaaaaaaa")], coversUpToId: "raw-3", coverage: { version: 1, fromExclusiveId: null, sourceEntryIds: ["raw-1", "raw-2", "raw-3"], truncatedSourceEntryIds: [] } }),
 			reflectionsRecordedEntry("om-ref", { reflections: [reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"])], coversUpToId: "raw-2" }),
 		];
 

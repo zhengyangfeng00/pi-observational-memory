@@ -222,7 +222,8 @@ describe("OAuth provider end-to-end consolidation", () => {
 		expect(skipped).toBe(
 			'Observational memory: observer skipped — authentication failed for provider "openai-codex" — OAuth credentials may have expired; run \'/login openai-codex\' to re-authenticate',
 		);
-		expect(appended).toEqual([]);
+		expect(appended.filter((entry) => entry.customType.startsWith("om."))).toEqual([]);
+		expect(appended).toContainEqual(expect.objectContaining({ customType: "observational-memory:event", data: expect.objectContaining({ type: "memory.observer.failed" }) }));
 
 		// eslint-disable-next-line no-console
 		console.log([
