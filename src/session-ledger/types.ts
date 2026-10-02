@@ -11,6 +11,7 @@ export const MEMORY_ID_PATTERN = /^[a-f0-9]{12}$/;
 export type Entry = {
 	type: string;
 	id: string;
+	parentId?: string | null;
 	timestamp?: string;
 	message?: unknown;
 	content?: unknown;

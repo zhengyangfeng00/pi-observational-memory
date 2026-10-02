@@ -117,6 +117,7 @@ describe("source-addressed serialization budget", () => {
 
 		expect(result).toEqual({
 			text: "",
+			content: [],
 			sourceEntryIds: [],
 			estimatedTokens: 0,
 			truncatedSourceEntryIds: [],

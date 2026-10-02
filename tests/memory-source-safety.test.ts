@@ -8,7 +8,7 @@ vi.mock("../src/agents/observer/agent.js", async (original) => ({
 import { registerCompactionHook } from "../src/hooks/compaction-hook.js";
 import { registerConsolidationTrigger } from "../src/hooks/consolidation-trigger.js";
 import { Runtime } from "../src/runtime.js";
-import { committedObserverFrontier, hasLegacyObservationBacklog } from "../src/session-ledger/coverage.js";
+import { committedObserverFrontier, hasCompactedObservationBacklog, hasLegacyObservationBacklog } from "../src/session-ledger/coverage.js";
 import { realTokensSinceAnchor, OM_OBSERVATIONS_RECORDED } from "../src/session-ledger/index.js";
 import { serializeSourceAddressedBranchEntries } from "../src/serialize.js";
 import { legacyExcerptFixture } from "./fixtures/legacy-excerpt.js";
@@ -125,6 +125,122 @@ describe("complete observer source safety", () => {
 		expect(contextText(manager)).toContain("DISTINCT_COMMAND_301");
 		expect(contextText(manager)).toContain("DISTINCT_OUTPUT_301");
 		expect(contextText(manager)).toContain("retain second tail");
+	});
+
+	it("re-enables on an intact native-compacted ledger, drains original source despite zero provider growth, and preserves memory records", async () => {
+		const manager = SessionManager.inMemory();
+		const sourceId = manager.appendMessage({ role: "user", content: "ORIGINAL_NATIVE_FACT".repeat(60), timestamp: Date.now() });
+		const boundary = manager.appendMessage({ role: "user", content: "retained tail", timestamp: Date.now() });
+		const oldRecord = manager.appendCustomEntry("om.observations.recorded", { observations: [observation("aaaaaaaaaaaa", { sourceEntryIds: [sourceId], content: "historical memory" })], coversUpToId: sourceId });
+		// No extension was loaded: ordinary Pi compaction writes no OM coverage.
+		const nativeCompactionId = manager.appendCompaction("lossy native summary", boundary, 50_000);
+		manager.appendMessage({ role: "assistant", content: [], provider: "test", model: "test", api: "test", stopReason: "stop", timestamp: Date.now(), usage: { totalTokens: 10 } } as any);
+		const s = harness(manager);
+		s.runtime.config.observeAfterTokens = 1_000_000;
+		(s.ctx as any).getContextUsage = () => ({ tokens: 10 });
+		expect(realTokensSinceAnchor(manager.getBranch(), OM_OBSERVATIONS_RECORDED, 10)).toBe(0);
+		expect(hasCompactedObservationBacklog(manager.getBranch())).toBe(true);
+		expect(committedObserverFrontier(manager.getBranch()).id).toBeNull();
+		expect(await s.compact(boundary)).toEqual({ cancel: true });
+		agents.observer.mockImplementationOnce(async (input) => {
+			expect(input.chunk).toContain("ORIGINAL_NATIVE_FACT");
+			expect(input.chunk).not.toContain("lossy native summary");
+			return [observation("bbbbbbbbbbbb", { sourceEntryIds: [sourceId], content: "ORIGINAL_NATIVE_FACT recovered" })];
+		});
+		await s.observe();
+		expect(manager.getEntry(oldRecord)).toBeDefined();
+		expect(hasCompactedObservationBacklog(manager.getBranch())).toBe(false);
+		const next = manager.appendMessage({ role: "user", content: "new tail", timestamp: Date.now() });
+		const result = await s.compact(next);
+		expect(result.compaction.firstKeptEntryId).toBeDefined();
+		expect(contextText(manager)).toContain("ORIGINAL_NATIVE_FACT recovered");
+
+		// Pi's actual in-memory fork retains the raw ancestor path/IDs, but
+		// excludes observation records appended after the selected fork point.
+		manager.createBranchedSession(nativeCompactionId);
+		expect(manager.getBranch().some((entry) => entry.id === sourceId)).toBe(true);
+		expect(manager.getEntry(oldRecord)).toBeDefined();
+		expect(committedObserverFrontier(manager.getBranch()).id).toBeNull();
+		expect(hasCompactedObservationBacklog(manager.getBranch())).toBe(true);
+	});
+
+	it("does not grant coverage to reduced imports missing the native kept boundary", async () => {
+		const manager = SessionManager.inMemory();
+		manager.appendCompaction("history unavailable", "missing", 50_000);
+		const boundary = manager.appendMessage({ role: "user", content: "new tail", timestamp: Date.now() });
+		const s = harness(manager);
+		await s.observe();
+		expect(agents.observer).not.toHaveBeenCalled();
+		expect(s.runtime.lastObserverError).toContain("unavailable_source_history");
+		expect(committedObserverFrontier(manager.getBranch()).id).toBeNull();
+		expect(await s.compact(boundary)).toEqual({ cancel: true });
+	});
+
+	it.each(["retain-none", "rewritten-root"])("blocks summary-only native imports with %s boundaries", async (kind) => {
+		const manager = SessionManager.inMemory();
+		const kept = kind === "rewritten-root" ? manager.appendMessage({ role: "user", content: "only retained source", timestamp: Date.now() }) : "missing";
+		const compaction = manager.appendCompaction("unavailable original history", kept, 50_000);
+		if (kind === "retain-none") (manager.getEntry(compaction) as any).firstKeptEntryId = compaction;
+		const boundary = manager.appendMessage({ role: "user", content: "new tail", timestamp: Date.now() });
+		const s = harness(manager);
+		await s.observe();
+		expect(agents.observer).not.toHaveBeenCalled();
+		expect(s.runtime.lastObserverError).toContain("unavailable_source_history");
+		expect(committedObserverFrontier(manager.getBranch()).id).toBeNull();
+		expect(await s.compact(boundary)).toEqual({ cancel: true });
+	});
+
+	it("observes image input through a compatible fallback and never strips images for a text-only fallback", async () => {
+		const image = { type: "image", mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j5c8AAAAASUVORK5CYII=" };
+		for (const fallbackInput of [["text"], ["text", "image"]]) {
+			agents.observer.mockReset();
+			const manager = SessionManager.inMemory();
+			const id = manager.appendMessage({ role: "user", content: [{ type: "text", text: "screenshot" }, image], timestamp: Date.now() } as any);
+			const s = harness(manager);
+			s.runtime.config.observerChunkMaxTokens = 50_000;
+			s.runtime.resolveModel = vi.fn(async () => ({ ok: true as const, model: { provider: "test", id: "vision", input: ["text", "image"], contextWindow: 100_000 } as any, apiKey: "key" }));
+			s.runtime.resolveFallbackModel = vi.fn(async () => ({ ok: true as const, fallbackUsed: true, model: { provider: "test", id: "fallback", input: fallbackInput, contextWindow: 100_000 } as any, apiKey: "key" }));
+			agents.observer.mockRejectedValueOnce(new Error("primary down"));
+			agents.observer.mockImplementationOnce(async (input) => {
+				expect(input.chunk.filter((block: any) => block.type === "image")).toEqual([image]);
+				return [observation("bbbbbbbbbbbb", { sourceEntryIds: [id] })];
+			});
+			await s.observe();
+			if (fallbackInput.includes("image")) {
+				expect(agents.observer).toHaveBeenCalledTimes(2);
+				expect(committedObserverFrontier(manager.getBranch()).id).toBe(id);
+			} else {
+				expect(agents.observer).toHaveBeenCalledTimes(1);
+				expect(s.runtime.lastObserverError).toContain("unsupported_model");
+				expect(committedObserverFrontier(manager.getBranch()).id).toBeNull();
+			}
+		}
+	});
+
+	it("cannot advance coverage for an unfit intact image entry", async () => {
+		const manager = SessionManager.inMemory();
+		manager.appendMessage({ role: "user", content: [{ type: "image", mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j5c8AAAAASUVORK5CYII=" }], timestamp: Date.now() });
+		const boundary = manager.appendMessage({ role: "user", content: "tail", timestamp: Date.now() });
+		const s = harness(manager); // 8000-token chunk cannot fit the vision reserve.
+		await s.observe();
+		expect(agents.observer).not.toHaveBeenCalled();
+		expect(s.runtime.lastObserverError).toContain("image_budget");
+		expect(committedObserverFrontier(manager.getBranch()).id).toBeNull();
+		expect(await s.compact(boundary)).toEqual({ cancel: true });
+	});
+
+	it("uses a compatible image fallback when the selected primary is text-only", async () => {
+		const manager = SessionManager.inMemory();
+		const id = manager.appendMessage({ role: "user", content: [{ type: "image", mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j5c8AAAAASUVORK5CYII=" }], timestamp: Date.now() });
+		const s = harness(manager);
+		s.runtime.config.observerChunkMaxTokens = 50_000;
+		s.runtime.resolveFallbackModel = vi.fn(async () => ({ ok: true as const, fallbackUsed: true, model: { provider: "test", id: "vision", input: ["text", "image"], contextWindow: 100_000 } as any, apiKey: "key" }));
+		agents.observer.mockResolvedValueOnce([observation("bbbbbbbbbbbb", { sourceEntryIds: [id] })]);
+		await s.observe();
+		expect(agents.observer).toHaveBeenCalledTimes(1);
+		expect(agents.observer.mock.calls[0][0].model.id).toBe("vision");
+		expect(agents.observer.mock.calls[0][0].chunk.some((block: any) => block.type === "image")).toBe(true);
+		expect(committedObserverFrontier(manager.getBranch()).id).toBe(id);
 	});
 
 	it.each([

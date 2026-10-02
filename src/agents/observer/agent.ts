@@ -7,7 +7,8 @@ import { logAgentStreamError } from "../stream-errors.js";
 import { resolveWorkerStreamSimple, type StreamableModelRegistry, type WorkerStreamSimple } from "../worker-stream.js";
 import { AGENT_LOOP_MAX_TOKENS, boundedMaxTokens } from "../../model-budget.js";
 import { OBSERVER_SYSTEM } from "./prompts.js";
-import { nowTimestamp, truncateRecordContent } from "../../serialize.js";
+import { validateObserverRequest } from "../../image-budget.js";
+import { nowTimestamp, truncateRecordContent, type ObserverContent } from "../../serialize.js";
 import type { Observation, Relevance } from "../../session-ledger/index.js";
 import { observationLineTokenCount } from "../../tokens.js";
 
@@ -18,7 +19,7 @@ interface RunObserverArgs {
 	env?: Record<string, string>;
 	priorReflections: string[];
 	priorObservations: string[];
-	chunk: string;
+	chunk: string | ObserverContent;
 	allowedSourceEntryIds: string[];
 	signal?: AbortSignal;
 	agentLoop?: typeof agentLoop;
@@ -105,8 +106,9 @@ export function normalizeSourceEntryIds(
 
 export async function runObserver(args: RunObserverArgs): Promise<Observation[] | undefined> {
 	const { model, apiKey, headers, env, priorReflections, priorObservations, chunk, allowedSourceEntryIds, signal } = args;
-	const conversation = chunk.trim();
-	if (!conversation) return undefined;
+	const conversation: ObserverContent = typeof chunk === "string" ? [{ type: "text", text: chunk.trim() }] : chunk;
+	if (conversation.some((block) => !block || (block.type !== "text" && block.type !== "image"))) throw new Error("unsupported_source: unknown observer content block");
+	if (!conversation.some((block) => block.type === "image" || (block.type === "text" && block.text.trim()))) return undefined;
 
 	const accumulated = new Map<string, Observation>();
 
@@ -174,12 +176,14 @@ ${joinOrEmpty(priorObservations)}
 Compress the following new conversation chunk into observations by calling record_observations one or more times. Do not restate facts already present in current reflections or current observations. Prefer inline conversation timestamps when assigning times; fall back to the current local time above only if no message timestamp applies. Stop calling the tool and reply with a short plain-text confirmation once the chunk is fully covered.
 
 NEW CONVERSATION CHUNK:
-${conversation}`;
+`;
 
 	const prompts: Message[] = [
 		{
 			role: "user",
-			content: [{ type: "text", text: userText }],
+			content: typeof chunk === "string"
+				? [{ type: "text", text: userText + chunk.trim() }]
+				: [{ type: "text", text: userText }, ...conversation],
 			timestamp: Date.now(),
 		},
 	];
@@ -213,13 +217,21 @@ ${conversation}`;
 			: {}),
 	};
 
+	const hasImages = conversation.some((block) => block.type === "image");
+	const llmContext = { messages: [...context.messages, ...prompts] as Message[], tools: context.tools };
+	validateObserverRequest(model, llmContext, config.maxTokens!);
+	const providerStream = resolveWorkerStreamSimple(model, args.modelRegistry, args.streamSimple);
+	const guardedStream: WorkerStreamSimple = (nextModel, nextContext, options) => {
+		validateObserverRequest(nextModel, nextContext, options?.maxTokens ?? config.maxTokens!);
+		return providerStream(nextModel, nextContext, options);
+	};
 	const loop = args.agentLoop ?? agentLoop;
 	const stream = loop(
 		prompts,
 		context,
 		config,
 		signal,
-		resolveWorkerStreamSimple(model, args.modelRegistry, args.streamSimple),
+		hasImages ? guardedStream : providerStream,
 	);
 	let streamError: { stopReason: string; errorMessage?: string } | undefined;
 	for await (const event of stream) {
@@ -234,8 +246,10 @@ ${conversation}`;
 	}
 	await stream.result();
 
+	// A partial tool record followed by a failed request cannot prove delivery
+	// and completion of the whole source chunk.
+	if (streamError && (hasImages || accumulated.size === 0)) throw new ObserverStreamError(streamError.stopReason, streamError.errorMessage);
 	if (accumulated.size === 0) {
-		if (streamError) throw new ObserverStreamError(streamError.stopReason, streamError.errorMessage);
 		return undefined;
 	}
 	return Array.from(accumulated.values());

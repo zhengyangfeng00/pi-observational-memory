@@ -31,7 +31,7 @@ import {
 	type V3MemoryCustomType,
 } from "../session-ledger/index.js";
 
-import { committedObserverFrontier, hasLegacyObservationBacklog } from "../session-ledger/coverage.js";
+import { committedObserverFrontier, hasCompactedObservationBacklog, hasLegacyObservationBacklog, unavailableSourceHistory } from "../session-ledger/coverage.js";
 import { captureBranch, emitMemoryEvent, operationId, persistMemoryState } from "../telemetry.js";
 
 type ResolvedModel = Extract<ResolveResult, { ok: true }>;
@@ -146,7 +146,7 @@ function stageDue(
 }
 
 function anyStageDue(entries: Entry[], runtime: Runtime, currentTokens: number | undefined): boolean {
-	return hasLegacyObservationBacklog(entries)
+	return hasCompactedObservationBacklog(entries) || hasLegacyObservationBacklog(entries)
 		|| stageDue(entries, runtime, currentTokens, OM_OBSERVATIONS_RECORDED, rawTokensSinceObservationCoverage, runtime.config.observeAfterTokens)
 		|| stageDue(entries, runtime, currentTokens, OM_REFLECTIONS_RECORDED, rawTokensSinceReflectionCoverage, runtime.config.reflectAfterTokens);
 }
@@ -407,10 +407,10 @@ async function runObserverStage(
 ): Promise<StageOutcome> {
 	const entries = ctx.sessionManager.getBranch() as Entry[];
 	const currentTokens = realContextTokens(ctx);
-	const recoveringLegacy = hasLegacyObservationBacklog(entries);
-	const real = !recoveringLegacy && currentTokens !== undefined ? realTokensSinceAnchor(entries, OM_OBSERVATIONS_RECORDED, currentTokens) : undefined;
+	const recoveringSource = hasLegacyObservationBacklog(entries) || hasCompactedObservationBacklog(entries);
+	const real = !recoveringSource && currentTokens !== undefined ? realTokensSinceAnchor(entries, OM_OBSERVATIONS_RECORDED, currentTokens) : undefined;
 	const tokens = real !== undefined ? real : rawTokensSinceObservationCoverage(entries);
-	if (!recoveringLegacy && tokens < runtime.config.observeAfterTokens) return "continue";
+	if (!recoveringSource && tokens < runtime.config.observeAfterTokens) return "continue";
 
 	const currentBranch = captureBranch(runtime, ctx);
 	const sessionMetadata = debugSessionMetadata(ctx);
@@ -445,29 +445,44 @@ async function runObserverStage(
 		return "abort";
 	}
 
+	if (unavailableSourceHistory(entries)) {
+		const failure = "unavailable_source_history: resume requires an intact raw session branch";
+		emitMemoryEvent(pi, ctx, "memory.observer.failed", { operationId: operationId(), ...workerMetadata(resolved), failure });
+		persistMemoryState(pi, ctx);
+		throw new Error(failure);
+	}
 	const lastCoverageIdx = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
 	const backlogEntries = sourceEntriesAfter(entries, lastCoverageIdx);
 
-	// Budget the text that is actually sent to the observer, including source
-	// labels and rendered message content. Complete entries are kept intact.
-	// Only a first entry that cannot fit by itself is represented by a clearly
-	// marked head/tail excerpt; the original ledger entry remains untouched.
+	// Budget ordered text plus actual image payloads. Complete entries are
+	// atomic; text excerpts and unfit image entries never grant coverage.
+	// runObserver additionally checks complete requests against each worker's
+	// context/input limits, including prior memory, tools and output allowance.
 	const contextWindow = observerChunkContextWindow(runtime, ctx, resolved);
 	const maxChunkTokens = resolveObserverChunkMaxTokens(runtime.config, contextWindow);
 	const {
-		text: chunk,
+		text: chunkText,
+		content: chunkContent,
 		sourceEntryIds,
 		estimatedTokens: chunkTokens,
 		truncatedSourceEntryIds,
 		incompleteSourceEntryIds,
 	} = serializeSourceAddressedBranchEntries(backlogEntries, { maxTokens: maxChunkTokens });
 	if (incompleteSourceEntryIds.length > 0) {
-		const failure = "unsupported_source: source payload cannot be completely represented for the text-only observer";
+		const failure = "unsupported_source: source payload cannot be completely represented for the observer";
 		emitMemoryEvent(pi, ctx, "memory.observer.failed", { operationId: operationId(), ...workerMetadata(resolved), incompleteSourceEntryIds, failure });
 		persistMemoryState(pi, ctx);
 		throw new Error(failure);
 	}
-	if (!chunk.trim() || sourceEntryIds.length === 0) return "continue";
+	if (truncatedSourceEntryIds.length > 0 && sourceEntryIds.length === 0) {
+		const failure = "image_budget: image-bearing source entry cannot fit intact in observerChunkMaxTokens";
+		emitMemoryEvent(pi, ctx, "memory.observer.failed", { operationId: operationId(), ...workerMetadata(resolved), truncatedSourceEntryIds, failure });
+		persistMemoryState(pi, ctx);
+		throw new Error(failure);
+	}
+	const hasImages = chunkContent.some((block) => block.type === "image");
+	const chunk = hasImages ? chunkContent : chunkText;
+	if (!chunkText.trim() || sourceEntryIds.length === 0) return "continue";
 	const coversUpToId = sourceEntryIds.at(-1);
 	if (!coversUpToId) return "continue";
 
@@ -506,20 +521,25 @@ async function runObserverStage(
 		coversUpToId, chunkTokens, truncatedSourceEntryIds,
 	}, async (commit) => {
 		if (truncatedSourceEntryIds.length > 0) throw new Error("incomplete_source: observer chunk contains an excerpt; raise observerChunkMaxTokens to observe the full source");
-		const observations = await runStageWithFallback(ctx, "observer", resolved, resolver, (worker) => runObserver({
-			model: worker.model as any,
-			apiKey: worker.apiKey,
-			headers: worker.headers,
-			env: worker.env,
-			priorReflections,
-			priorObservations,
-			chunk,
-			allowedSourceEntryIds: sourceEntryIds,
-			maxTurns: runtime.config.agentMaxTurns,
-			maxOutputTokens: runtime.config.agentMaxTokens,
-			thinkingLevel: workerThinkingLevel(runtime, worker),
-			modelRegistry: ctx.modelRegistry,
-		}), modelAttempts);
+		const observations = await runStageWithFallback(ctx, "observer", resolved, resolver, (worker) => {
+			if (hasImages && !(worker.model as { input?: string[] }).input?.includes("image")) {
+				throw new Error("unsupported_model: observer model does not accept images");
+			}
+			return runObserver({
+				model: worker.model as any,
+				apiKey: worker.apiKey,
+				headers: worker.headers,
+				env: worker.env,
+				priorReflections,
+				priorObservations,
+				chunk,
+				allowedSourceEntryIds: sourceEntryIds,
+				maxTurns: runtime.config.agentMaxTurns,
+				maxOutputTokens: runtime.config.agentMaxTokens,
+				thinkingLevel: workerThinkingLevel(runtime, worker),
+				modelRegistry: ctx.modelRegistry,
+			});
+		}, modelAttempts);
 		if (!currentBranch()) throw new Error("stale worker branch; result discarded");
 		if (!observations || observations.length === 0) {
 			// Deliberate empty backs off over the same uncovered span.
