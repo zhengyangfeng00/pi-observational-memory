@@ -41,6 +41,30 @@ export function committedObserverFrontier(entries: Entry[]): { id: string | null
 	return { id: entries[index]?.id ?? null, index };
 }
 
+/** Pi keeps raw ledger entries after native compaction. Re-observe omitted,
+ * uncovered source when re-enabled, even if provider growth is zero. A native
+ * summary itself never grants coverage or substitutes for unavailable source. */
+export function hasCompactedObservationBacklog(entries: Entry[]): boolean {
+	const frontier = committedObserverFrontier(entries);
+	return entries.some((entry, index) => {
+		if (entry.type !== "compaction") return false;
+		const kept = entries.findIndex((item) => item.id === entry.firstKeptEntryId);
+		return kept >= 0 && kept <= index && entries.slice(frontier.index + 1, kept).some(source);
+	});
+}
+
+/** Reduced/imported branches must not silently replace unknown native history. */
+export function unavailableSourceHistory(entries: Entry[]): boolean {
+	if (entries.length > 0 && entries[0].parentId != null) return true;
+	return entries.some((entry) => {
+		if (entry.type !== "compaction") return false;
+		const kept = entries.findIndex((item) => item.id === entry.firstKeptEntryId);
+		// Native compaction summarizes earlier source. A summary-only import
+		// with a rewritten root/boundary still cannot prove that source exists.
+		return kept < 0 || !entries.slice(0, kept).some(source);
+	});
+}
+
 /** Upgrade recovery must not be suppressed by a small post-compaction provider delta. */
 export function hasLegacyObservationBacklog(entries: Entry[]): boolean {
 	const frontier = committedObserverFrontier(entries);
@@ -84,6 +108,7 @@ export function safeCompactionCut(entries: Entry[], desiredId: string): SafeCut 
 	const frontier = committedObserverFrontier(entries);
 	const blocked = (reason: string): SafeCut => ({ ok: false, reason, frontier: frontier.id });
 	const desired = entries.findIndex((entry) => entry.id === desiredId);
+	if (unavailableSourceHistory(entries)) return blocked("unavailable_source_history");
 	if (desired < 0) return blocked("unknown_desired_boundary");
 	if (frontier.id === null) return blocked("no_committed_observer_coverage");
 	const uncovered = entries.findIndex((entry, index) => index > frontier.index && source(entry));

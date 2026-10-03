@@ -10,7 +10,7 @@ V3 is ledger-centered: memory state is reconstructed by folding V3 ledger entrie
 
 | Surface | Purpose |
 |---|---|
-| `turn_end` observer trigger | Maybe run the observer in the background. |
+| `agent_start` / `turn_end` observer trigger | Maybe run the observer in the background, including raw-ledger recovery after native compaction. |
 | `turn_end` reflect/drop trigger | Maybe run the due reflector, then run dropper maintenance only after same-run successful reflection. |
 | `agent_settled` compaction trigger | Maybe call `ctx.compact()` when idle and over `compactAfterTokens`, after Pi finishes retries and queued continuation. |
 | `session_before_compact` hook | Build the V3 compaction payload deterministically. |
@@ -164,29 +164,33 @@ These details are what later visible projections read. The ledger remains the so
 
 ## Observer flow
 
-The observer trigger runs on `turn_end`.
+The observer trigger runs on `agent_start` and `turn_end`.
 
-1. Load config if needed.
-2. Skip if `passive` is true.
-3. Skip if `observerInFlight` is true.
-4. Count raw/source tokens since latest observation coverage.
-5. Skip if below `observeAfterTokens`.
-6. Honor any deliberate-empty backoff until another `observeAfterTokens` of source tokens arrive.
-7. Select the oldest size-capped chunk after the latest observation coverage marker.
-8. Serialize those source entries for the observer prompt.
-9. Resolve the memory model.
-10. Run `runObserver()` in a background task.
-11. Validate source ids returned by the model.
-12. Compute deterministic 12-character ids and per-observation token counts in code.
-13. Append `om.observations.recorded` only if at least one observation was accepted and the complete ordered input range validates.
+1. Load config; skip passive mode or an in-flight consolidation.
+2. Check observation/reflection scheduling. Uncovered raw source omitted by an earlier Pi compaction, and legacy records lacking complete-input evidence, require recovery even with zero provider growth.
+3. Honor deliberate-empty backoff until another `observeAfterTokens` of source tokens arrive.
+4. Resolve the memory model before deriving the chunk cap, using the smaller primary/fallback context window when both are known.
+5. Select an oldest-first complete source prefix. Unknown roles/blocks and malformed images stop the prefix; they cannot be skipped.
+6. Serialize ordered text and actual images with source-entry labels, role/timestamp headers, and tool-result metadata. Image data and MIME types are copied unchanged into the observer's Pi user message. An attachment path or placeholder is never the observer's image input.
+7. Require image capability for each attempted model, including a resolution-time or runtime fallback. A text-only primary may use a vision fallback; a text-only fallback cannot receive an image chunk.
+8. Validate the complete multimodal request before the loop and every provider request, including continuations. Count prior memory, system/user prompts, tools, text, images, request margin, and the model-bounded response allowance. Require a known context window and honor declared image-count/request-byte limits.
+9. Validate returned source IDs and compute deterministic observation IDs/token counts. Append only a non-empty result whose complete ordered source range validates. A multimodal stream failure discards partial tool records rather than advancing coverage.
 
-Legacy observation records lacking complete-input evidence do not grant coverage.
-Their original source is re-observed oldest-first, even below normal scheduling
-thresholds or with zero post-compaction provider growth. Existing memory remains
-queryable while that recovery completes. Unsupported source payloads (including
-images and unknown roles/blocks) fail explicitly rather than being silently omitted.
+Images are atomic with their surrounding text. An image-bearing entry that cannot fit produces `image_budget`, with no partial delivery or coverage. Oversized text-only entries produce excerpt diagnostics and fail with `incomplete_source`. Raise `observerChunkMaxTokens`, lower `agentMaxTokens`, or select a larger compatible memory model as appropriate. Provider image-token accounting is not exposed uniformly: the local conservative allowance is documented in [configuration.md](configuration.md#observerchunkmaxtokens), not claimed as an exact count. Provider failures never authorize image coverage.
 
-If no observations are generated, the worker writes no entry and does not advance coverage. A later eligible observer run will see a larger range. Deliberate empty runs back off until another `observeAfterTokens` worth of new source tokens arrives, so they do not re-fire every turn. Observer chunks use the configured/model-derived token budget, oldest-first, so a large backlog drains in complete-entry slices. An individual source that only fits as an excerpt fails with `incomplete_source` and retains coverage; raise the budget to observe it in full. API/stream failures surface as `observer failed` / `observer.stream_error` rather than as an empty run.
+The ledger, provenance, lifecycle envelopes, and stored memory remain textual and unchanged. Reflector/dropper receive observations and reflections only, never raw image blocks. Text-only observer calls retain their existing prompt and stream behavior. Recall remains a text rendering with non-text placeholders; it does not re-deliver image evidence.
+
+If no observations are generated, the worker writes no entry and does not advance coverage. Deliberate empty runs back off until another `observeAfterTokens` worth of new source tokens arrives. Large backlogs drain in complete-entry slices. Existing legacy memory remains queryable during recovery.
+
+## Disable, re-enable, and resume
+
+The hosting application disables memory by **not loading this extension**. Passive mode is not a disable switch: it retains recall, telemetry, and coverage-based compaction interception. Exclusion permits ordinary Pi compaction and preserves historical memory records. The host owns durable per-session settings, defaults, turn snapshots, and fork inheritance; this extension does not persist that setting.
+
+Pi native compaction normally retains the entire raw branch in its ledger. Re-enabling on that intact ledger is supported: workers re-observe uncovered original source, oldest-first, even below the scheduling threshold or with zero post-compaction provider growth. Native summaries themselves grant no observer coverage. Existing committed coverage remains valid for its exact branch-local source IDs. Memory compaction stays blocked or clamped until the required raw source has complete committed coverage.
+
+Resume and forks that preserve the raw ancestor path, IDs, source payloads, and memory records use the same branch-local validation. Forking before a memory record does not inherit that later record's coverage. Reduced/imported histories with a dangling raw ancestor or unavailable native kept boundary fail with `unavailable_source_history`; no summary is treated as a substitute for those missing sources. Arbitrarily rewritten summary-only imports are not a supported recovery format. Restore the intact session or use a fresh session rather than synthesizing coverage. Context-edited replacements retain the existing fail-closed compaction guard.
+
+A bounded, read-only provider replay is described in [multimodal-replay.md](multimodal-replay.md).
 
 ## Reflect/drop flow
 

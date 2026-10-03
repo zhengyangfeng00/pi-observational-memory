@@ -1,0 +1,52 @@
+{
+  "model": {
+    "provider": "openai-codex",
+    "id": "gpt-6.1-sol",
+    "contextWindow": 272000
+  },
+  "scope": "user-envelope replay of actual captured image, not a historical user entry",
+  "capturedImageEntryId": "3c6044e4",
+  "sourceEntryIds": [
+    "user-replay-3c6044e4"
+  ],
+  "chunkTokens": 51489,
+  "originalImages": [
+    {
+      "mimeType": "image/png",
+      "sha256": "dd8b984977e3b3cfe89363960b189b280e1c7c2c0e6094904996220e68aaead2"
+    }
+  ],
+  "wireRequests": [
+    {
+      "request": 1,
+      "payloadImages": [
+        [
+          {
+            "mimeType": "image/png",
+            "sha256": "dd8b984977e3b3cfe89363960b189b280e1c7c2c0e6094904996220e68aaead2"
+          }
+        ]
+      ]
+    },
+    {
+      "request": 2,
+      "payloadImages": [
+        [
+          {
+            "mimeType": "image/png",
+            "sha256": "dd8b984977e3b3cfe89363960b189b280e1c7c2c0e6094904996220e68aaead2"
+          }
+        ]
+      ]
+    }
+  ],
+  "delivered": true,
+  "requests": 2,
+  "responseAllowance": 2048,
+  "maxTurns": 2,
+  "timeoutMs": 90000,
+  "observationCount": 1,
+  "citedImageEntry": true,
+  "observedThrough": "user-replay-3c6044e4",
+  "failure": null
+}

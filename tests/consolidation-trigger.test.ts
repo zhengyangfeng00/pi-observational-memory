@@ -376,6 +376,26 @@ describe("V3 consolidation trigger", () => {
 		expect(mockAgents.runDropper).not.toHaveBeenCalled();
 	});
 
+	it("keeps reflector and dropper textual after observing an image-bearing source", async () => {
+		const image = { type: "image", mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j5c8AAAAASUVORK5CYII=" };
+		const s = setup({ entries: [{ type: "message", id: "raw-1", message: { role: "user", content: [image], timestamp: 0 } } as any], observerChunkMaxTokens: 50_000, observationsPoolTargetTokens: 5 });
+		s.runtime.resolveModel.mockResolvedValueOnce({ ok: true, model: { reasoning: true, input: ["text", "image"], contextWindow: 100_000 } as any, apiKey: "key", headers: { h: "v" } });
+		mockAgents.runObserver.mockResolvedValueOnce([obsA]);
+		mockAgents.runReflector.mockResolvedValueOnce([refA]);
+		mockAgents.runDropper.mockResolvedValueOnce([obsA.id]);
+		s.fire();
+		await s.runLaunchedWork();
+		expect(mockAgents.runObserver.mock.calls[0][0].chunk.filter((block: any) => block.type === "image")).toEqual([image]);
+		for (const worker of [mockAgents.runReflector, mockAgents.runDropper]) {
+			expect(worker).toHaveBeenCalledOnce();
+			const input = worker.mock.calls[0][0];
+			expect(input.chunk).toBeUndefined();
+			expect(input.observations.every((obs: any) => typeof obs.content === "string")).toBe(true);
+			expect(JSON.stringify(input)).not.toContain(image.data);
+			expect(JSON.stringify(input)).not.toContain('"type":"image"');
+		}
+	});
+
 	it("shows routine worker notifications by default", async () => {
 		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
 		mockAgents.runObserver.mockResolvedValueOnce([obsA]);

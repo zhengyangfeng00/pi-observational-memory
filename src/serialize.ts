@@ -1,3 +1,5 @@
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import { estimateImageTokens, isSupportedImage } from "./image-budget.js";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import { estimateStringTokens } from "./tokens.js";
@@ -142,8 +144,12 @@ export function serializeBranchEntries(entries: RenderableEntry[]): string {
 	return blocks.join("\n\n");
 }
 
+export type ObserverContent = (TextContent | ImageContent)[];
+
 export type SourceAddressedSerialization = {
+	/** Text-only diagnostic/recall rendering; never use this to deliver images. */
 	text: string;
+	content: ObserverContent;
 	sourceEntryIds: string[];
 	estimatedTokens: number;
 	truncatedSourceEntryIds: string[];
@@ -151,7 +157,7 @@ export type SourceAddressedSerialization = {
 };
 
 export type SourceAddressedSerializationOptions = {
-	/** Maximum estimated tokens in the final source-addressed text. */
+	/** Maximum estimated text-plus-image tokens in the source-addressed input. */
 	maxTokens?: number;
 };
 
@@ -175,14 +181,15 @@ function isSourceRenderableEntry(entry: RenderableEntry): boolean {
 	return entry.type === "message" || entry.type === "custom_message" || entry.type === "branch_summary";
 }
 
-function isCompleteContent(content: unknown): boolean {
+function isCompleteContent(content: unknown, assistant = false): boolean {
 	if (typeof content === "string") return true;
 	return Array.isArray(content) && content.every((block) => {
 		if (!block || typeof block !== "object") return false;
 		if (block.type === "text") return typeof block.text === "string";
-		if (block.type === "thinking") return block.redacted === true || typeof block.thinking === "string";
-		if (block.type === "toolCall") return typeof block.name === "string" && block.arguments !== undefined;
-		// A text-only observer cannot prove coverage of images/unknown blocks.
+		if (block.type === "thinking") return assistant && (block.redacted === true || typeof block.thinking === "string");
+		if (block.type === "toolCall") return assistant && typeof block.name === "string" && block.arguments !== undefined;
+		if (block.type === "image") return isSupportedImage(block);
+		// Unknown blocks cannot grant source coverage.
 		return false;
 	});
 }
@@ -194,17 +201,48 @@ function isCompleteSource(entry: RenderableEntry): boolean {
 	const msg = entry.message as Record<string, unknown>;
 	switch (msg.role) {
 		case "user": case "assistant": case "toolResult": case "system": case "custom":
-			return isCompleteContent(msg.content);
+			return isCompleteContent(msg.content, msg.role === "assistant");
 		case "bashExecution": return typeof msg.command === "string" && typeof msg.output === "string";
 		case "branchSummary": case "compactionSummary": return typeof msg.summary === "string";
 		default: return false;
 	}
 }
 
+/** Render image-bearing content with one source/role header and ordered blocks. */
+function sourceContent(entry: RenderableEntry, text: string): ObserverContent {
+	const msg = entry.message as Record<string, unknown> | undefined;
+	const content = entry.type === "custom_message" ? entry.content : msg?.content;
+	if (!Array.isArray(content) || !content.some((block) => block.type === "image")) return [{ type: "text", text }];
+	// Obtain the ordinary renderer's header and footer, without rendering raw
+	// images as text or duplicating system checkpoint/tool-result metadata.
+	let marker = "\u0000observer-content\u0000";
+	while (text.includes(marker)) marker += "\u0000";
+	const shell = entry.type === "custom_message"
+		? { ...entry, content: marker }
+		: { ...entry, message: { ...msg, content: marker } };
+	const rendered = serializeBranchEntries([shell]);
+	const position = rendered.indexOf(marker);
+	const result: ObserverContent = [{ type: "text", text: `[Source entry id: ${entry.id}]\n${rendered.slice(0, position)}` }];
+	for (let i = 0; i < content.length; i++) {
+		const block = content[i];
+		if (i > 0) result.push({ type: "text", text: "\n" });
+		if (block.type === "image") result.push({ type: "image", data: block.data, mimeType: block.mimeType });
+		else result.push({ type: "text", text: textAndPlaceholders([block], { includeThinking: true, omitRedactedThinking: true }) });
+	}
+	const suffix = rendered.slice(position + marker.length);
+	if (suffix) result.push({ type: "text", text: suffix });
+	return result;
+}
+
+export function estimateObserverContentTokens(content: ObserverContent): number {
+	return content.reduce((sum, block) => sum + (block.type === "text" ? estimateStringTokens(block.text) : estimateImageTokens(block)), 0);
+}
+
 /**
  * Serialize complete source entries up to the token budget. If the first entry
- * alone exceeds the budget, report a clearly marked head/tail excerpt. Callers
- * decide whether excerpts can grant coverage; the observer requires full input.
+ * alone exceeds the budget, report a clearly marked text head/tail excerpt;
+ * image-bearing entries are atomic and reported as unfit with no partial input.
+ * Neither case grants coverage: the observer requires complete input.
  * The original ledger entry is never modified and remains recallable by id.
  */
 export function serializeSourceAddressedBranchEntries(
@@ -212,6 +250,7 @@ export function serializeSourceAddressedBranchEntries(
 	options: SourceAddressedSerializationOptions = {},
 ): SourceAddressedSerialization {
 	const blocks: string[] = [];
+	const content: ObserverContent = [];
 	const sourceEntryIds: string[] = [];
 	const truncatedSourceEntryIds: string[] = [];
 	const incompleteSourceEntryIds: string[] = [];
@@ -228,14 +267,25 @@ export function serializeSourceAddressedBranchEntries(
 		const label = `[Source entry id: ${entry.id}]`;
 		const block = `${label}\n${rendered}`;
 		const separator = blocks.length > 0 ? "\n\n" : "";
-		const blockTokens = estimateStringTokens(`${separator}${block}`);
+		const entryContent = sourceContent(entry, block);
+		const hasImages = entryContent.some((item) => item.type === "image");
+		const blockTokens = hasImages
+			? estimateObserverContentTokens(entryContent) + estimateStringTokens(separator)
+			: estimateStringTokens(`${separator}${block}`);
 		const maxTokens = options.maxTokens;
 
 		if (maxTokens !== undefined && estimatedTokens + blockTokens > maxTokens) {
 			if (blocks.length > 0) break;
+			// Images are atomic: neither the payload nor accompanying text may
+			// be excerpted. Report the unfit entry so callers fail explicitly.
+			if (hasImages) {
+				truncatedSourceEntryIds.push(entry.id);
+				break;
+			}
 			const excerpt = truncateSourceBlockToTokenBudget(label, rendered, maxTokens);
 			if (!excerpt) break;
 			blocks.push(excerpt);
+			content.push({ type: "text", text: excerpt });
 			sourceEntryIds.push(entry.id);
 			truncatedSourceEntryIds.push(entry.id);
 			estimatedTokens = estimateStringTokens(excerpt);
@@ -243,12 +293,14 @@ export function serializeSourceAddressedBranchEntries(
 		}
 
 		blocks.push(block);
+		if (separator) content.push({ type: "text", text: separator });
+		content.push(...entryContent);
 		sourceEntryIds.push(entry.id);
 		estimatedTokens += blockTokens;
 	}
 
 	const text = blocks.join("\n\n");
-	return { text, sourceEntryIds, estimatedTokens: estimateStringTokens(text), truncatedSourceEntryIds, incompleteSourceEntryIds };
+	return { text, content, sourceEntryIds, estimatedTokens: content.some((block) => block.type === "image") ? estimatedTokens : estimateStringTokens(text), truncatedSourceEntryIds, incompleteSourceEntryIds };
 }
 
 function renderRecallMessage(entry: RenderableEntry): string | null {

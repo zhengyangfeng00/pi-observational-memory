@@ -29,6 +29,19 @@ single place that applies Pi's auth acceptance rule — both the primary and fal
 it. Do not make the fallback mandatory: with none configured, the previous skip/fail-safe behavior
 must be byte-for-byte unchanged (covered by `tests/runtime.test.ts` and `tests/consolidation-trigger.test.ts`).
 
+## Multimodal observation and resume
+
+`src/serialize.ts` returns both diagnostic `text` and ordered observer `content`.
+Never deliver its placeholder-containing `text` for image-bearing chunks. Image
+requests are guarded in `src/image-budget.ts` before every provider call; fallback
+must independently support images. Reflector/dropper stay textual.
+
+Pi native compaction retains raw ledger history. Resume recovery must read
+`getBranch()`, not the compacted model projection, and never treat native summaries
+as observer coverage. Supported re-enable/fork behavior is in
+`docs/how-it-works.md#disable-re-enable-and-resume`. Live replay is opt-in via
+`scripts/replay-observer.mjs`; tests/tooling require Node 22.19+.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

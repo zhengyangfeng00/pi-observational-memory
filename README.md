@@ -202,6 +202,10 @@ Project settings override global settings.
 
 `PI_OBSERVATIONAL_MEMORY_PASSIVE` can override only `passive`.
 
+The observer supports ordered text and actual image payloads from user messages, tool results, and custom messages when the selected worker model accepts images. Source labels and MIME types are preserved; incompatible models/fallbacks, unknown blocks, and over-budget inputs cannot advance coverage. Reflector/dropper remain text-only. See [input budgets](docs/configuration.md#observerchunkmaxtokens) and [captured provider replay](docs/multimodal-replay.md).
+
+Hosts disable memory by excluding the extension from the Pi run, not by setting passive mode. Re-enabling after ordinary Pi compaction is supported when the intact raw branch is available; omitted, uncovered source is re-observed before memory-based compaction can discard it. Summary-only imports are not supported. Hosts own per-session defaults, durable settings, turn snapshots, and fork inheritance. See [resume behavior](docs/how-it-works.md#disable-re-enable-and-resume).
+
 A typical config:
 
 ```json
