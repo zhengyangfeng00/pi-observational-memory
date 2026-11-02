@@ -1,7 +1,9 @@
 import type { Context, ImageContent, Model } from "@earendil-works/pi-ai";
 
-/** Conservative local allowance, not a provider's exact vision-token count. */
-export const IMAGE_TOKEN_RESERVE = 16_384;
+/** Fixed per-image allowance on top of the pixel-patch charge. */
+export const IMAGE_TOKEN_OVERHEAD = 1_024;
+/** Providers downscale images to fit at least this box before tokenizing. */
+export const IMAGE_MAX_EDGE = 2_048;
 export const OBSERVER_REQUEST_MARGIN = 4_096;
 
 function imageDimensions(image: ImageContent): [number, number] | undefined {
@@ -46,11 +48,15 @@ export function isSupportedImage(value: unknown): value is ImageContent {
 }
 
 export function estimateImageTokens(image: ImageContent): number {
-	// Charge the encoded payload as well as a large per-image vision reserve.
-	// Do not use the host's flat 1200-token image heuristic for worker budgets.
+	// Providers bill vision input by pixel dimensions after downscaling, not by
+	// encoded size (OpenAI: 32px patches or 512px tiles; Anthropic: ~w*h/750).
+	// Charge 4 tokens per 32px patch of the image scaled to fit IMAGE_MAX_EDGE,
+	// a conservative multiple of those rates. Request bytes are checked
+	// separately against declared model limits.
 	const [width, height] = imageDimensions(image) ?? [65_535, 65_535];
-	return IMAGE_TOKEN_RESERVE + Math.ceil(image.data.length / 4)
-		+ 4 * Math.ceil(width / 32) * Math.ceil(height / 32);
+	const scale = Math.min(1, IMAGE_MAX_EDGE / Math.max(width, height));
+	return IMAGE_TOKEN_OVERHEAD
+		+ 4 * Math.ceil(Math.ceil(width * scale) / 32) * Math.ceil(Math.ceil(height * scale) / 32);
 }
 
 /** Check every multimodal request, including loop continuations and fallback. */

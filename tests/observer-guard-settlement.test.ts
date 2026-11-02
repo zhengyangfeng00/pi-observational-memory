@@ -8,8 +8,10 @@ import { Runtime } from "../src/runtime.js";
 import { committedObserverFrontier } from "../src/session-ledger/coverage.js";
 import { fullProjection, OM_OBSERVATIONS_RECORDED } from "../src/session-ledger/index.js";
 import { MEMORY_EVENT } from "../src/telemetry.js";
+import { pngWithDimensions } from "./fixtures/images.js";
 
-const image = { type: "image" as const, mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j5c8AAAAASUVORK5CYII=" };
+// Declares 2048 x 2048 pixels: the largest image cost after provider downscaling.
+const image = pngWithDimensions(2048, 2048);
 const model = (id: string, contextWindow: number) => ({ api: "openai-completions", provider: "test", id, input: ["text", "image"], maxTokens: 8_192, contextWindow }) as any;
 
 /** A real tool turn records an observation and grows the next request budget. */
