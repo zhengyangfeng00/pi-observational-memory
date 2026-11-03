@@ -2,10 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 import { runAgentLoop } from "@earendil-works/pi-agent-core";
 import { createAssistantMessageEventStream, Type } from "@earendil-works/pi-ai";
 import { runObserver, ObserverStreamError } from "../src/agents/observer/agent.js";
-import { estimateImageTokens, IMAGE_TOKEN_RESERVE, validateObserverRequest } from "../src/image-budget.js";
+import { estimateImageTokens, validateObserverRequest } from "../src/image-budget.js";
 import { serializeSourceAddressedBranchEntries } from "../src/serialize.js";
+import { pngWithDimensions } from "./fixtures/images.js";
 
-const image = { type: "image" as const, mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j5c8AAAAASUVORK5CYII=" };
+// Declares 2048 x 2048 pixels: the largest image cost after provider downscaling.
+const image = pngWithDimensions(2048, 2048);
 const model = { input: ["text", "image"], contextWindow: 100_000, maxTokens: 8_192 } as any;
 const entries = [
 	{ type: "message", id: "user-image", message: { role: "user", content: [{ type: "text", text: "before user" }, image, { type: "text", text: "after user" }], timestamp: 0 } },
@@ -57,21 +59,25 @@ describe("multimodal observer", () => {
 		expect(text).toContain("before\n\nafter");
 	});
 
-	it("charges dimensions even for a tiny encoded payload declaring a large image", () => {
-		const header = Buffer.from(image.data, "base64");
-		header.writeUInt32BE(8192, 16);
-		header.writeUInt32BE(8192, 20);
-		const large = { ...image, data: header.toString("base64") };
-		expect(estimateImageTokens(large)).toBeGreaterThan(250_000);
-		const source = serializeSourceAddressedBranchEntries([{ type: "custom_message", id: "large", content: [large] }], { maxTokens: 60_000 });
-		expect(source.content).toEqual([]);
-		expect(source.truncatedSourceEntryIds).toEqual(["large"]);
+	it("estimates image cost from pixel dimensions, not encoded payload size", () => {
+		const small = pngWithDimensions(2000, 660);
+		const padded = { ...small, data: Buffer.concat([Buffer.from(small.data, "base64"), Buffer.alloc(1_000_000)]).toString("base64") };
+		expect(estimateImageTokens(padded)).toBe(estimateImageTokens(small));
+		expect(estimateImageTokens(pngWithDimensions(2000, 1460))).toBeGreaterThan(estimateImageTokens(small));
 	});
 
-	it("charges encoded bytes and dimensions as well as a vision reserve; never excerpts image entries", () => {
+	it("caps image cost at the provider downscaled size so one screenshot fits a default chunk", () => {
+		const max = estimateImageTokens(pngWithDimensions(2048, 2048));
+		expect(estimateImageTokens(pngWithDimensions(8192, 8192))).toBe(max);
+		expect(estimateImageTokens(pngWithDimensions(65_535, 1))).toBeLessThanOrEqual(max);
+		// Default chunk cap: 20% of a 128k-token vision model's context window.
+		const source = serializeSourceAddressedBranchEntries([{ type: "custom_message", id: "shot", content: [pngWithDimensions(4026, 1328)] }], { maxTokens: 25_600 });
+		expect(source.sourceEntryIds).toEqual(["shot"]);
+	});
+
+	it("never excerpts image entries that exceed the chunk budget", () => {
 		const full = serializeSourceAddressedBranchEntries(entries.slice(0, 1));
 		expect(full.estimatedTokens).toBeGreaterThan(estimateImageTokens(image));
-		expect(estimateImageTokens(image)).toBeGreaterThan(IMAGE_TOKEN_RESERVE);
 		const blocked = serializeSourceAddressedBranchEntries(entries, { maxTokens: full.estimatedTokens - 1 });
 		expect(blocked.sourceEntryIds).toEqual([]);
 		expect(blocked.content).toEqual([]);
@@ -120,7 +126,7 @@ describe("multimodal observer", () => {
 	});
 
 	it("budgets normalized tool declarations on real agent-loop continuations", async () => {
-		const selected = { ...model, provider: "test", api: "test", id: "vision", contextWindow: 62_000 };
+		const selected = { ...model, provider: "test", api: "test", id: "vision", contextWindow: 63_000 };
 		const schema = Type.Object({ value: Type.String({ description: "s".repeat(32_000) }) });
 		const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "done" }], details: undefined }));
 		const tool = { name: "schema_tool", label: "Schema tool", description: "exercise schema budgeting", parameters: schema, execute };

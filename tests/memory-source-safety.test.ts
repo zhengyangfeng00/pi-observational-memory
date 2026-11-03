@@ -13,6 +13,7 @@ import { realTokensSinceAnchor, OM_OBSERVATIONS_RECORDED } from "../src/session-
 import { serializeSourceAddressedBranchEntries } from "../src/serialize.js";
 import { legacyExcerptFixture } from "./fixtures/legacy-excerpt.js";
 import { observation } from "./fixtures/session.js";
+import { pngWithDimensions } from "./fixtures/images.js";
 
 beforeEach(() => { agents.observer.mockReset(); });
 
@@ -219,9 +220,9 @@ describe("complete observer source safety", () => {
 
 	it("cannot advance coverage for an unfit intact image entry", async () => {
 		const manager = SessionManager.inMemory();
-		manager.appendMessage({ role: "user", content: [{ type: "image", mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j5c8AAAAASUVORK5CYII=" }], timestamp: Date.now() });
+		manager.appendMessage({ role: "user", content: [pngWithDimensions(2048, 2048)], timestamp: Date.now() });
 		const boundary = manager.appendMessage({ role: "user", content: "tail", timestamp: Date.now() });
-		const s = harness(manager); // 8000-token chunk cannot fit the vision reserve.
+		const s = harness(manager); // 8000-token chunk cannot fit a 2048 x 2048 image.
 		await s.observe();
 		expect(agents.observer).not.toHaveBeenCalled();
 		expect(s.runtime.lastObserverError).toContain("image_budget");
